@@ -35,6 +35,7 @@ def main():
     
     script_dir = Path(__file__).parent
     pkg_dir = script_dir / "native"
+    src_dir = script_dir / "src" / "elbo_sdk"
     
     if args.output_dir:
         output_dir = Path(args.output_dir)
@@ -43,16 +44,20 @@ def main():
     
     # Check for compiled modules
     ext_suffix = get_extension_suffix()
-    modules = list(pkg_dir.glob(f"*{ext_suffix}"))
+    modules = list(src_dir.glob(f"*{ext_suffix}"))
     
     if not modules:
-        print(f"Error: No compiled modules found in {pkg_dir}")
+        print(f"Error: No compiled modules found in {src_dir}")
         print("Make sure to build with cmake first: ninja -C build-pro")
         sys.exit(1)
     
     print(f"Found {len(modules)} compiled modules:")
     for mod in modules:
         print(f"  {mod.name}")
+    
+    # Copy modules to pkg_dir
+    for mod in modules:
+        shutil.copy2(mod, pkg_dir)
     
     # Clean up previous builds
     for cleanup_dir in ["build", "pivot_lib.egg-info"]:

@@ -1,8 +1,8 @@
 # Copyright (C) 2025 Nicholas Wierzbowski / Elbo Studio
 # This file is part of the Pivot Bridge for Blender.
 
-# Load common configuration
-include(${CMAKE_CURRENT_SOURCE_DIR}/../../pivot-cmake-common/PivotCommon.cmake)
+# Load common configuration (use the SDK-local copy so elbo-sdk can be used as a submodule)
+include(${CMAKE_CURRENT_SOURCE_DIR}/../pivot-cmake-common/PivotCommon.cmake)
 
 # Setup Cython using common macro
 _pivot_setup_cython()

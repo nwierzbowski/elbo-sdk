@@ -14,6 +14,35 @@ _pivot_prepare_dir("${PIVOT_BIN_DIR}" "${PIVOT_PLATFORM_ID}")
 # Setup Boost for IPC
 _pivot_setup_boost()
 
+# -----------------------------------------------------------------------------
+# Native SDK library (C++)
+# -----------------------------------------------------------------------------
+
+add_library(elbo_sdk_cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_bridge.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/engine_client.cpp
+)
+
+set_target_properties(elbo_sdk_cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+target_compile_features(elbo_sdk_cpp PUBLIC cxx_std_17)
+
+target_include_directories(elbo_sdk_cpp
+  PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp
+)
+
+if(Boost_FOUND)
+  target_include_directories(elbo_sdk_cpp PUBLIC ${Boost_INCLUDE_DIRS})
+elseif(boost_ext_POPULATED)
+  target_include_directories(elbo_sdk_cpp PUBLIC ${boost_ext_SOURCE_DIR})
+endif()
+
+if(TARGET Boost::json)
+  target_link_libraries(elbo_sdk_cpp PUBLIC Boost::json)
+endif()
+
 # Build Cython Subdirectory
 if(BUILD_PY_MODULE)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cython/CMakeLists.txt)

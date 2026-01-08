@@ -15,27 +15,39 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, see <https://www.gnu.org/licenses>.
 
-"""Pivot Engine Management Module
+"""Pivot Engine IPC client (SDK).
 
-This module provides a unified interface for managing the C++ pivot engine subprocess.
+This module intentionally contains no Blender (`bpy`) interactions.
 
-Responsibilities:
-- Process lifecycle management (start/stop subprocess)
-- Direct communication interface (JSON commands)
-- Low-level process state (is_running, PID, etc.)
+High-level responsibilities:
+- Launch/stop the engine process (native C++ client)
+- Send JSON commands over stdin/stdout and read responses
+- Build engine command payloads (Python dict helpers)
+
+Engine binary discovery is host-specific. For portability, the SDK supports:
+- Explicit `engine_path=` arguments
+- `PIVOT_ENGINE_PATH` environment variable
 """
 
 import os
-import subprocess
 import atexit
 import json
 import platform
 import builtins
-import sys
-from typing import Dict, Any, Optional
+import shutil
+from typing import Optional
 
-# Note: Blender-side state tracking lives in blender-bridge/pivot_lib.
-# This module intentionally avoids importing bpy-specific code.
+from libcpp.string cimport string
+
+cdef extern from "elbo_sdk/engine_client.h" namespace "elbo_sdk":
+    cdef cppclass EngineClient:
+        EngineClient() except +
+        bint start(const string& engine_path, string* error_out) except +
+        void stop() except +
+        bint is_running() const
+        string send_command(const string& command_json, string* error_out) except +
+        void send_command_async(const string& command_json, string* error_out) except +
+        string wait_for_response(int expected_id, string* error_out) except +
 
 # Command IDs for engine communication
 cdef int COMMAND_SET_SURFACE_TYPES = 4
@@ -46,103 +58,32 @@ cdef int COMMAND_GET_GROUP_SURFACE_TYPES = 2
 
 
 def get_engine_binary_path() -> str:
-    """Get the path to the correct engine binary for this platform/architecture.
-    
-    Returns:
-        str: Path to the pivot_engine executable
+    """Resolve the pivot_engine binary path.
+
+    For portability, this function does not inspect Blender modules or repo layouts.
+    Host applications should prefer passing `engine_path=` to `get_engine_communicator()`.
+
+    Resolution order:
+    1) `PIVOT_ENGINE_PATH` env var
+    2) `pivot_engine` on PATH
+    3) `bin/<platform_id>/pivot_engine` relative to this package (optional)
     """
-    bin_dir = None
-    
-    # For Blender extensions, find the pivot extension directory
-    # The extension is installed as bl_ext.<repo>.<extension_name>.pivot
-    try:
-        # Look for the main pivot module - could be named various ways
-        pivot_module_names = [
-            'bl_ext.vscode_development.pivot',  # VS Code development
-            'bl_ext.user_default.pivot',        # User installed
-            'pivot',                            # Direct import
-        ]
-        
-        for mod_name in pivot_module_names:
-            if mod_name in sys.modules:
-                mod = sys.modules[mod_name]
-                if hasattr(mod, '__file__') and mod.__file__:
-                    pivot_dir = os.path.dirname(mod.__file__)
-                    potential_bin = os.path.join(pivot_dir, 'bin')
-                    if os.path.exists(potential_bin):
-                        bin_dir = potential_bin
-                        break
-        
-        # Also search for any module ending with .pivot that has a bin directory
-        if bin_dir is None:
-            for mod_name, mod in sys.modules.items():
-                if mod_name.endswith('.pivot') and hasattr(mod, '__file__') and mod.__file__:
-                    pivot_dir = os.path.dirname(mod.__file__)
-                    potential_bin = os.path.join(pivot_dir, 'bin')
-                    if os.path.exists(potential_bin):
-                        bin_dir = potential_bin
-                        break
-    except Exception as e:
-        print(f"[Pivot] Error finding pivot module path: {e}")
-    
-    # Fallback: search sys.path for pivot/bin
-    if bin_dir is None:
-        for path in sys.path:
-            potential_bin = os.path.join(path, 'pivot', 'bin')
-            if os.path.exists(potential_bin):
-                bin_dir = potential_bin
-                break
-            # Also check if path itself is the pivot directory
-            if path.endswith('pivot'):
-                potential_bin = os.path.join(path, 'bin')
-                if os.path.exists(potential_bin):
-                    bin_dir = potential_bin
-                    break
-    
-    # Last resort for development: navigate from blender-bridge
-    if bin_dir is None:
-        module_dir = os.path.dirname(__file__) if '__file__' in dir() else os.getcwd()
-        # Try various paths relative to where the addon might be
-        candidates = [
-            os.path.join(module_dir, '..', 'pivot', 'bin'),  # site-packages layout
-            os.path.join(module_dir, '..', '..', 'pivot', 'bin'),  # nested
-            os.path.join(module_dir, '..', '..', 'blender-bridge', 'pivot', 'bin'),  # dev layout
-        ]
-        for candidate in candidates:
-            if os.path.exists(candidate):
-                bin_dir = candidate
-                break
-        else:
-            bin_dir = candidates[0]  # Use first as fallback even if doesn't exist
-    
-    # Detect OS and architecture
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-    
-    # Map architecture names
-    if machine in ('x86_64', 'amd64'):
-        arch = 'x86-64'
-    elif machine in ('aarch64', 'arm64'):
-        arch = 'arm64'
-    else:
-        arch = machine
-    
-    # Determine binary name
-    if system == 'windows':
-        exe_name = 'pivot_engine.exe'
-    else:
-        exe_name = 'pivot_engine'
-    
-    # Platform identifier for directories
-    platform_id = f'{system}-{arch}'
-    
-    # Try platform-specific subdirectory first
-    platform_dir = os.path.join(bin_dir, platform_id)
+    env_path = os.getenv("PIVOT_ENGINE_PATH")
+    if env_path:
+        return env_path
+
+    exe_name = "pivot_engine.exe" if platform.system().lower() == "windows" else "pivot_engine"
+    which = shutil.which(exe_name)
+    if which:
+        return which
+
+    module_dir = os.path.dirname(__file__) if '__file__' in dir() else os.getcwd()
+    bin_dir = os.path.join(module_dir, "bin")
+    platform_dir = os.path.join(bin_dir, get_platform_id())
     platform_binary = os.path.join(platform_dir, exe_name)
     if os.path.exists(platform_binary):
         return platform_binary
-    
-    # Fallback to root bin directory (legacy structure)
+
     fallback_binary = os.path.join(bin_dir, exe_name)
     return fallback_binary
 
@@ -170,152 +111,109 @@ def get_platform_id() -> str:
 cdef class PivotEngine:
     """Unified interface for the C++ pivot engine subprocess."""
 
-    cdef object _process
-    cdef bint _is_running
+    cdef EngineClient* _client
 
     def __init__(self):
-        self._process = None
-        self._is_running = False
+        # Kept for backward compatibility; actual init is in __cinit__.
+        pass
 
-    def start(self) -> bint:
+    def __cinit__(self):
+        self._client = new EngineClient()
+
+    def __dealloc__(self):
+        try:
+            if self._client is not NULL:
+                self._client.stop()
+        except Exception:
+            pass
+        if self._client is not NULL:
+            del self._client
+            self._client = NULL
+
+    def start(self, engine_path: Optional[str] = None) -> bint:
         """Start the pivot engine executable.
 
         Returns:
             bool: True if started successfully, False otherwise
         """
-        if self._is_running:
-            print("Pivot engine is already running")
-            return True
+        cdef string err
 
         try:
-            # Get the path to the executable for this platform/architecture
-            engine_path = get_engine_binary_path()
-            print(f"Engine path: {engine_path}")
+            if self.is_running():
+                return True
 
-            # Check if executable exists
-            if not os.path.exists(engine_path):
-                print(f"Warning: Engine executable not found at {engine_path}")
+            resolved = engine_path or get_engine_binary_path()
+
+            if not resolved or not os.path.exists(resolved):
+                print(f"Warning: Engine executable not found at {resolved}")
                 return False
 
-            print(f"Starting pivot engine: {engine_path}")
+            ok = self._client.start(resolved.encode('utf-8'), &err)
+            if not ok:
+                err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
+                print(f"Failed to start pivot engine: {err_py}")
+                return False
 
-            # Start the engine process
-            self._process = subprocess.Popen(
-                [engine_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=None,  # Inherit stderr to show in Blender console
-                text=True,
-                bufsize=1,  # Line buffered
-                universal_newlines=True
-            )
-
-            self._is_running = True
-            print("Pivot engine started successfully")
             return True
-
         except Exception as e:
             print(f"Failed to start pivot engine: {e}")
-            self._process = None
-            self._is_running = False
             return False
 
     def stop(self) -> None:
         """Stop the pivot engine executable."""
-        if not self._is_running or self._process is None:
+        if self._client is NULL:
             return
-
-        try:
-            print("Stopping pivot engine...")
-
-            # Send quit command to the engine
-            if self._process.poll() is None:  # Process is still running
-                try:
-                    self._process.stdin.write("__quit__\n")
-                    self._process.stdin.flush()
-
-                    # Wait a bit for graceful shutdown
-                    self._process.wait(timeout=2.0)
-                except (subprocess.TimeoutExpired, BrokenPipeError):
-                    # Force kill if graceful shutdown fails
-                    self._process.terminate()
-                    try:
-                        self._process.wait(timeout=1.0)
-                    except subprocess.TimeoutExpired:
-                        self._process.kill()
-                        self._process.wait()
-
-            print("Pivot engine stopped")
-            self._process = None
-            self._is_running = False
-
-        except Exception as e:
-            print(f"Error stopping pivot engine: {e}")
-            if self._process:
-                try:
-                    self._process.kill()
-                except:
-                    pass
-            self._process = None
-            self._is_running = False
+        self._client.stop()
 
     def is_running(self) -> bint:
         """Check if the engine is currently running."""
-        return self._is_running and self._process is not None and self._process.poll() is None
+        if self._client is NULL:
+            return False
+        return self._client.is_running()
 
     def send_command(self, dict command_dict) -> dict:
         """Send a command to the engine and get the final response."""
+        cdef string err
+
         if not self.is_running():
-            raise RuntimeError("Engine process not started or has terminated. Make sure the addon is properly registered.")
+            raise RuntimeError("Engine process not started or has terminated.")
 
-        try:
-            # Send command as JSON
-            command_json = json.dumps(command_dict) + "\n"
-            self._process.stdin.write(command_json)
-            self._process.stdin.flush()
+        payload = json.dumps(command_dict)
+        resp_line = self._client.send_command(payload.encode('utf-8'), &err)
+        if resp_line.size() == 0:
+            err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
+            raise RuntimeError(f"Communication error: {err_py}")
 
-            # Read responses until we get the final one (with "ok")
-            while True:
-                response_line = self._process.stdout.readline().strip()
-                if not response_line:
-                    raise RuntimeError("Engine process terminated unexpectedly")
-
-                response = json.loads(response_line)
-                if "ok" in response:
-                    return response
-
-        except Exception as e:
-            raise RuntimeError(f"Communication error: {e}")
+        resp_py = (<bytes>resp_line).decode('utf-8', 'replace')
+        return json.loads(resp_py)
 
     def send_command_async(self, dict command_dict) -> None:
         """Send a command to the engine without waiting for response."""
-        if not self.is_running():
-            raise RuntimeError("Engine process not started or has terminated. Make sure the addon is properly registered.")
+        cdef string err
 
-        try:
-            command_json = json.dumps(command_dict) + "\n"
-            self._process.stdin.write(command_json)
-            self._process.stdin.flush()
-        except Exception as e:
-            raise RuntimeError(f"Communication error: {e}")
+        if not self.is_running():
+            raise RuntimeError("Engine process not started or has terminated.")
+
+        payload = json.dumps(command_dict)
+        self._client.send_command_async(payload.encode('utf-8'), &err)
+        if err.size():
+            err_py = (<bytes>err).decode('utf-8', 'replace')
+            raise RuntimeError(f"Communication error: {err_py}")
 
     def wait_for_response(self, int expected_id) -> dict:
         """Wait for a response with the specified ID."""
+        cdef string err
+
         if not self.is_running():
-            raise RuntimeError("Engine process not started or has terminated. Make sure the addon is properly registered.")
+            raise RuntimeError("Engine process not started or has terminated.")
 
-        try:
-            while True:
-                response_line = self._process.stdout.readline().strip()
-                if not response_line:
-                    raise RuntimeError("Engine process terminated unexpectedly")
+        resp_line = self._client.wait_for_response(expected_id, &err)
+        if resp_line.size() == 0:
+            err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
+            raise RuntimeError(f"Communication error: {err_py}")
 
-                response = json.loads(response_line)
-                if response.get("id") == expected_id:
-                    return response
-
-        except Exception as e:
-            raise RuntimeError(f"Communication error: {e}")
+        resp_py = (<bytes>resp_line).decode('utf-8', 'replace')
+        return json.loads(resp_py)
 
     def send_group_classifications(self, dict group_surface_map) -> bint:
         """Send a batch classification update to the engine."""
@@ -457,10 +355,10 @@ def stop_engine() -> None:
     _engine_instance.stop()
 
 
-def get_engine_communicator() -> PivotEngine:
+def get_engine_communicator(engine_path: Optional[str] = None) -> PivotEngine:
     """Get the engine instance for communication."""
     if not _engine_instance.is_running():
-        started = _engine_instance.start()
+        started = _engine_instance.start(engine_path=engine_path)
         if not started:
             raise RuntimeError("Engine process not started. Make sure the addon is properly registered.")
     return _engine_instance
@@ -468,7 +366,8 @@ def get_engine_communicator() -> PivotEngine:
 
 def get_engine_process():
     """Get the current engine process (for backward compatibility)."""
-    return _engine_instance._process
+    # The SDK no longer exposes a raw subprocess handle.
+    return None
 
 
 def sync_license_mode() -> str:
