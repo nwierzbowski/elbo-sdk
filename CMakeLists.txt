@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(elbo_sdk LANGUAGES CXX)
+
+# Load common Pivot configuration
+include(${CMAKE_CURRENT_SOURCE_DIR}/pivot-cmake-common/PivotCommon.cmake)
+
+# Build toggles
+option(BUILD_PY_MODULE "Build Python (Cython) extension" ON)
+
+# Prepare output directories
+_pivot_prepare_dir("${PIVOT_BIN_DIR}" "${PIVOT_PLATFORM_ID}")
+
+# Setup Boost for IPC
+_pivot_setup_boost()
+
+# Build Cython Subdirectory
+if(BUILD_PY_MODULE)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/cython/CMakeLists.txt)
+        add_subdirectory(cython)
+    endif()
+endif()
+
+# Convenience meta-target
+if(NOT TARGET dev)
+  add_custom_target(dev ALL)
+  if(TARGET bridge)
+    add_dependencies(dev bridge)
+  endif()
+endif()

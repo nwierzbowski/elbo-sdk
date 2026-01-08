@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: elbo_sdk
+Version: 1.0.0
+Summary: Platform-independent SDK for Elbo engine IPC + shared memory
+Author-email: Nicholas Wierzbowski <nicholas.wierzbowski@elbo.studio>
+Requires-Python: >=3.11
