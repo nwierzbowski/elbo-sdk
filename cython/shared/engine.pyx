@@ -19,167 +19,78 @@
 
 This module intentionally contains no Blender (`bpy`) interactions.
 
-High-level responsibilities:
-- Launch/stop the engine process (native C++ client)
-- Send JSON commands over stdin/stdout and read responses
-- Build engine command payloads (Python dict helpers)
-
-Engine binary discovery is host-specific. For portability, the SDK supports:
-- Explicit `engine_path=` arguments
-- `PIVOT_ENGINE_PATH` environment variable
+The Cython layer is intentionally thin:
+- Native process + IPC logic lives in C++ (`PivotEngineApi`)
+- This file only converts Python <-> JSON strings and exposes a small Python API
 """
 
-import os
 import atexit
-import json
-import platform
 import builtins
-import shutil
+import json
 from typing import Optional
 
 from libcpp.string cimport string
 
-cdef extern from "elbo_sdk/engine_client.h" namespace "elbo_sdk":
-    cdef cppclass EngineClient:
-        EngineClient() except +
-        bint start(const string& engine_path, string* error_out) except +
-        void stop() except +
-        bint is_running() const
-        string send_command(const string& command_json, string* error_out) except +
-        void send_command_async(const string& command_json, string* error_out) except +
-        string wait_for_response(int expected_id, string* error_out) except +
+cimport engine as engine_cpp
 
-# Command IDs for engine communication
-cdef int COMMAND_SET_SURFACE_TYPES = 4
-cdef int COMMAND_DROP_GROUPS = 5
-cdef int COMMAND_CLASSIFY_GROUPS = 1
-cdef int COMMAND_CLASSIFY_OBJECTS = 1
-cdef int COMMAND_GET_GROUP_SURFACE_TYPES = 2
+
+def get_platform_id() -> str:
+    cdef string s = engine_cpp._cpp_get_platform_id()
+    return (<bytes>s).decode('utf-8', 'replace')
 
 
 def get_engine_binary_path() -> str:
     """Resolve the pivot_engine binary path.
 
-    For portability, this function does not inspect Blender modules or repo layouts.
-    Host applications should prefer passing `engine_path=` to `get_engine_communicator()`.
-
     Resolution order:
     1) `PIVOT_ENGINE_PATH` env var
-    2) `pivot_engine` on PATH
-    3) `bin/<platform_id>/pivot_engine` relative to this package (optional)
+    2) `pivot_engine` on `PATH`
+
+    Returns an empty string if no binary can be resolved.
     """
-    env_path = os.getenv("PIVOT_ENGINE_PATH")
-    if env_path:
-        return env_path
-
-    exe_name = "pivot_engine.exe" if platform.system().lower() == "windows" else "pivot_engine"
-    which = shutil.which(exe_name)
-    if which:
-        return which
-
-    module_dir = os.path.dirname(__file__) if '__file__' in dir() else os.getcwd()
-    bin_dir = os.path.join(module_dir, "bin")
-    platform_dir = os.path.join(bin_dir, get_platform_id())
-    platform_binary = os.path.join(platform_dir, exe_name)
-    if os.path.exists(platform_binary):
-        return platform_binary
-
-    fallback_binary = os.path.join(bin_dir, exe_name)
-    return fallback_binary
-
-
-def get_platform_id() -> str:
-    """Get platform identifier for module loading (e.g., 'linux-x86-64', 'macos-arm64').
-    
-    Returns:
-        str: Platform identifier string
-    """
-    system = platform.system().lower()
-    machine = platform.machine().lower()
-    
-    # Map architecture names
-    if machine in ('x86_64', 'amd64'):
-        arch = 'x86-64'
-    elif machine in ('aarch64', 'arm64'):
-        arch = 'arm64'
-    else:
-        arch = machine
-    
-    return f'{system}-{arch}'
+    cdef string s = engine_cpp.resolve_engine_binary_path()
+    return (<bytes>s).decode('utf-8', 'replace')
 
 
 cdef class PivotEngine:
-    """Unified interface for the C++ pivot engine subprocess."""
-
-    cdef EngineClient* _client
-
-    def __init__(self):
-        # Kept for backward compatibility; actual init is in __cinit__.
-        pass
+    cdef engine_cpp.PivotEngineApi* _api
 
     def __cinit__(self):
-        self._client = new EngineClient()
+        # The singleton lives in C++ and persists across module reloads.
+        self._api = &engine_cpp.engine_singleton()
 
-    def __dealloc__(self):
-        try:
-            if self._client is not NULL:
-                self._client.stop()
-        except Exception:
-            pass
-        if self._client is not NULL:
-            del self._client
-            self._client = NULL
-
-    def start(self, engine_path: Optional[str] = None) -> bint:
-        """Start the pivot engine executable.
-
-        Returns:
-            bool: True if started successfully, False otherwise
-        """
+    def start(self, engine_path: Optional[str] = None):
         cdef string err
+        cdef string path
 
-        try:
-            if self.is_running():
-                return True
+        if engine_path is None:
+            engine_path = get_engine_binary_path()
 
-            resolved = engine_path or get_engine_binary_path()
+        if engine_path is None:
+            engine_path = ""
 
-            if not resolved or not os.path.exists(resolved):
-                print(f"Warning: Engine executable not found at {resolved}")
-                return False
-
-            ok = self._client.start(resolved.encode('utf-8'), &err)
-            if not ok:
-                err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
-                print(f"Failed to start pivot engine: {err_py}")
-                return False
-
-            return True
-        except Exception as e:
-            print(f"Failed to start pivot engine: {e}")
-            return False
+        path = engine_path.encode('utf-8')
+        ok = self._api.start(path, &err)
+        if not ok:
+            err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
+            print(f"Failed to start pivot engine: {err_py}")
+        return ok
 
     def stop(self) -> None:
-        """Stop the pivot engine executable."""
-        if self._client is NULL:
-            return
-        self._client.stop()
+        self._api.stop()
 
-    def is_running(self) -> bint:
-        """Check if the engine is currently running."""
-        if self._client is NULL:
-            return False
-        return self._client.is_running()
+    def is_running(self):
+        return self._api.is_running()
 
     def send_command(self, dict command_dict) -> dict:
-        """Send a command to the engine and get the final response."""
         cdef string err
+        cdef string resp_line
 
         if not self.is_running():
             raise RuntimeError("Engine process not started or has terminated.")
 
         payload = json.dumps(command_dict)
-        resp_line = self._client.send_command(payload.encode('utf-8'), &err)
+        resp_line = self._api.send_command(payload.encode('utf-8'), &err)
         if resp_line.size() == 0:
             err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
             raise RuntimeError(f"Communication error: {err_py}")
@@ -188,26 +99,25 @@ cdef class PivotEngine:
         return json.loads(resp_py)
 
     def send_command_async(self, dict command_dict) -> None:
-        """Send a command to the engine without waiting for response."""
         cdef string err
 
         if not self.is_running():
             raise RuntimeError("Engine process not started or has terminated.")
 
         payload = json.dumps(command_dict)
-        self._client.send_command_async(payload.encode('utf-8'), &err)
+        self._api.send_command_async(payload.encode('utf-8'), &err)
         if err.size():
             err_py = (<bytes>err).decode('utf-8', 'replace')
             raise RuntimeError(f"Communication error: {err_py}")
 
     def wait_for_response(self, int expected_id) -> dict:
-        """Wait for a response with the specified ID."""
         cdef string err
+        cdef string resp_line
 
         if not self.is_running():
             raise RuntimeError("Engine process not started or has terminated.")
 
-        resp_line = self._client.wait_for_response(expected_id, &err)
+        resp_line = self._api.wait_for_response(expected_id, &err)
         if resp_line.size() == 0:
             err_py = (<bytes>err).decode('utf-8', 'replace') if err.size() else "unknown error"
             raise RuntimeError(f"Communication error: {err_py}")
@@ -215,134 +125,19 @@ cdef class PivotEngine:
         resp_py = (<bytes>resp_line).decode('utf-8', 'replace')
         return json.loads(resp_py)
 
-    def send_group_classifications(self, dict group_surface_map) -> bint:
-        """Send a batch classification update to the engine."""
-        if not group_surface_map:
-            return True
-
-        if not self.is_running():
-            return False
-
-        cdef list payload = []
-        for name, value in group_surface_map.items():
-            try:
-                surface_int = int(value)
-            except (TypeError, ValueError):
-                continue
-            payload.append({"group_name": name, "surface_type": surface_int})
-
-        if not payload:
-            return True
-
-        try:
-            command = {
-                "id": COMMAND_SET_SURFACE_TYPES,
-                "op": "set_surface_types",
-                "classifications": payload
-            }
-            response = self.send_command(command)
-            if not response.get("ok", False):
-                error = response.get("error", "Unknown error")
-                print(f"Failed to update group classifications: {error}")
-                return False
-            return True
-        except Exception as exc:
-            print(f"Error sending group classifications: {exc}")
-            return False
-
-    def drop_groups(self, list group_names) -> int:
-        """Drop groups from the engine cache."""
-        if not group_names:
-            return 0
-
-        if not self.is_running():
-            return -1
-
-        try:
-            command = {
-                "id": COMMAND_DROP_GROUPS,
-                "op": "drop_groups",
-                "group_names": group_names
-            }
-            response = self.send_command(command)
-            if not response.get("ok", False):
-                error = response.get("error", "Unknown error")
-                print(f"Failed to drop groups from engine: {error}")
-                return -1
-            dropped_count = response.get("dropped_count", 0)
-            return dropped_count
-        except Exception as exc:
-            print(f"Error dropping groups from engine: {exc}")
-            return -1
-
-    def build_standardize_groups_command(self, str verts_shm_name, str edges_shm_name, 
-                                     str rotations_shm_name, str scales_shm_name, 
-                                     str offsets_shm_name, list vert_counts, 
-                                     list edge_counts, list object_counts, 
-                                     list group_names, list surface_contexts) -> dict:
-        """Build a standardize_groups command for the engine (Pro edition)."""
-        return {
-            "id": COMMAND_CLASSIFY_GROUPS,
-            "op": "standardize_groups",
-            "shm_verts": verts_shm_name,
-            "shm_edges": edges_shm_name,
-            "shm_rotations": rotations_shm_name,
-            "shm_scales": scales_shm_name,
-            "shm_offsets": offsets_shm_name,
-            "vert_counts": vert_counts,
-            "edge_counts": edge_counts,
-            "object_counts": object_counts,
-            "group_names": group_names,
-            "surface_contexts": surface_contexts,
-        }
-
-    def build_standardize_synced_groups_command(self, list group_names, list surface_contexts) -> dict:
-        """Build a command to reclassify already-synced groups without uploading mesh data."""
-        return {
-            "id": COMMAND_CLASSIFY_GROUPS,
-            "op": "standardize_synced_groups",
-            "group_names": group_names,
-            "surface_contexts": surface_contexts
-        }
-
-    def build_standardize_objects_command(self, str verts_shm_name, str edges_shm_name,
-                                      str rotations_shm_name, str scales_shm_name,
-                                      str offsets_shm_name, list vert_counts,
-                                      list edge_counts, list object_names, list surface_contexts) -> dict:
-        """Build a standardize_objects command for the engine."""
-        return {
-            "id": COMMAND_CLASSIFY_OBJECTS,
-            "op": "standardize_objects",
-            "shm_verts": verts_shm_name,
-            "shm_edges": edges_shm_name,
-            "shm_rotations": rotations_shm_name,
-            "shm_scales": scales_shm_name,
-            "shm_offsets": offsets_shm_name,
-            "vert_counts": vert_counts,
-            "edge_counts": edge_counts,
-            "object_names": object_names,
-            "surface_contexts": surface_contexts
-        }
-
-    def build_get_surface_types_command(self) -> dict:
-        """Build a get_surface_types command for the engine."""
-        return {
-            "id": COMMAND_GET_GROUP_SURFACE_TYPES,
-            "op": "get_surface_types"
-        }
-
 
 # Global engine instance stored on builtins to persist across reloads
-cdef PivotEngine _engine_instance
-
 _temp_instance = getattr(builtins, '_pivot_engine_instance', None)
 if _temp_instance is None:
     _engine_instance = PivotEngine()
     builtins._pivot_engine_instance = _engine_instance
 else:
     _engine_instance = _temp_instance
-    if _engine_instance.is_running():
-        _engine_instance.stop()
+    try:
+        if _engine_instance.is_running():
+            _engine_instance.stop()
+    except Exception:
+        pass
 
 
 def start_engine() -> bint:
@@ -382,5 +177,4 @@ def sync_license_mode() -> str:
     return engine_mode
 
 
-# Register cleanup function to run on Python exit
 atexit.register(stop_engine)

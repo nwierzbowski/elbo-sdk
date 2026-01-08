@@ -21,6 +21,10 @@ _pivot_setup_boost()
 add_library(elbo_sdk_cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_bridge.cpp
   ${CMAKE_CURRENT_SOURCE_DIR}/cpp/engine_client.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/engine_api.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/uid.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_manager_api.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_segment.cpp
 )
 
 set_target_properties(elbo_sdk_cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
