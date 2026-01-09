@@ -1,35 +1,9 @@
 #pragma once
 
 #include <string>
+#include <stdexcept>
 
 namespace elbo_sdk {
-
-// Higher-level API used by the Python bindings.
-// This intentionally keeps the Python/Cython layer thin.
-class PivotEngineApi {
-public:
-    PivotEngineApi();
-    ~PivotEngineApi();
-
-    PivotEngineApi(const PivotEngineApi&) = delete;
-    PivotEngineApi& operator=(const PivotEngineApi&) = delete;
-
-    bool start(const std::string& engine_path, std::string* error_out = nullptr);
-    void stop();
-
-    bool is_running() const;
-
-    std::string send_command(const std::string& command_json, std::string* error_out = nullptr);
-    void send_command_async(const std::string& command_json, std::string* error_out = nullptr);
-    std::string wait_for_response(int expected_id, std::string* error_out = nullptr);
-
-private:
-    struct Impl;
-    Impl* impl_;
-};
-
-// Process-wide engine singleton. This persists across Python module reloads.
-PivotEngineApi& engine_singleton();
 
 // Runtime platform identifier (e.g. "linux-x86-64", "macos-arm64").
 std::string get_platform_id();
@@ -39,5 +13,19 @@ std::string get_platform_id();
 // 2) pivot_engine on PATH
 // Returns empty string if not found.
 std::string resolve_engine_binary_path();
+
+// Sync license mode from the engine (returns edition like "PRO", "STANDARD").
+std::string sync_license_mode_cpp();
+
+// C-style API surface that forwards to the internal EngineClient instance.
+// These functions provide a stable, static API that Cython can call directly
+// without needing a pointer to a singleton object.
+void start(const std::string& engine_path = "");
+void stop();
+bool is_running();
+
+std::string send_command(const std::string& command_json);
+void send_command_async(const std::string& command_json);
+std::string wait_for_response(int expected_id);
 
 } // namespace elbo_sdk

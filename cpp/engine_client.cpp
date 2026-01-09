@@ -1,4 +1,5 @@
 #include "elbo_sdk/engine_client.h"
+#include "elbo_sdk/engine_api.h"
 
 #include <boost/json.hpp>
 #include <boost/process.hpp>
@@ -68,11 +69,20 @@ EngineClient::~EngineClient() {
     impl_ = nullptr;
 }
 
-bool EngineClient::start(const std::string& engine_path, std::string* error_out) {
+void EngineClient::start(std::string engine_path) {
     std::lock_guard<std::mutex> lock(impl_->mu);
 
     if (impl_->is_running_unsafe()) {
-        return true;
+        return;
+    }
+
+    std::string resolved = engine_path;
+    if (resolved.empty()) {
+        resolved = resolve_engine_binary_path();
+    }
+
+    if (resolved.empty()) {
+        throw std::runtime_error("engine path not provided and could not be resolved");
     }
 
     try {
@@ -80,26 +90,23 @@ bool EngineClient::start(const std::string& engine_path, std::string* error_out)
         impl_->out = std::make_unique<bp::ipstream>();
 
         impl_->child = std::make_unique<bp::child>(
-            engine_path,
+            resolved,
             bp::std_in < *impl_->in,
             bp::std_out > *impl_->out
         );
 
         if (!impl_->child->running()) {
-            if (error_out) *error_out = "engine process did not start";
             impl_->child.reset();
             impl_->in.reset();
             impl_->out.reset();
-            return false;
+            throw std::runtime_error("engine process did not start");
         }
 
-        return true;
     } catch (const std::exception& e) {
-        if (error_out) *error_out = e.what();
         impl_->child.reset();
         impl_->in.reset();
         impl_->out.reset();
-        return false;
+        throw std::runtime_error(e.what());
     }
 }
 
@@ -145,18 +152,23 @@ bool EngineClient::is_running() const {
     return impl_->is_running_unsafe();
 }
 
-std::string EngineClient::send_command(const std::string& command_json, std::string* error_out) {
+std::string EngineClient::send_command(const std::string& command_json) {
     std::lock_guard<std::mutex> lock(impl_->mu);
 
+    if (!impl_->is_running_unsafe()) {
+        throw std::runtime_error("Engine process not started or has terminated.");
+    }
+
     std::string line = Impl::ensure_newline(command_json);
-    if (!impl_->write_line_unsafe(line, error_out)) {
-        return {};
+    std::string err;
+    if (!impl_->write_line_unsafe(line, &err)) {
+        throw std::runtime_error(err);
     }
 
     while (true) {
         std::string resp_line;
-        if (!impl_->read_line_unsafe(&resp_line, error_out)) {
-            return {};
+        if (!impl_->read_line_unsafe(&resp_line, &err)) {
+            throw std::runtime_error(err);
         }
         if (resp_line.empty()) {
             continue;
@@ -176,20 +188,32 @@ std::string EngineClient::send_command(const std::string& command_json, std::str
     }
 }
 
-void EngineClient::send_command_async(const std::string& command_json, std::string* error_out) {
+void EngineClient::send_command_async(const std::string& command_json) {
     std::lock_guard<std::mutex> lock(impl_->mu);
+
+    if (!impl_->is_running_unsafe()) {
+        throw std::runtime_error("Engine process not started or has terminated.");
+    }
 
     std::string line = Impl::ensure_newline(command_json);
-    (void)impl_->write_line_unsafe(line, error_out);
+    std::string err;
+    if (!impl_->write_line_unsafe(line, &err)) {
+        throw std::runtime_error(err);
+    }
 }
 
-std::string EngineClient::wait_for_response(int expected_id, std::string* error_out) {
+std::string EngineClient::wait_for_response(int expected_id) {
     std::lock_guard<std::mutex> lock(impl_->mu);
+
+    if (!impl_->is_running_unsafe()) {
+        throw std::runtime_error("Engine process not started or has terminated.");
+    }
 
     while (true) {
         std::string resp_line;
-        if (!impl_->read_line_unsafe(&resp_line, error_out)) {
-            return {};
+        std::string err;
+        if (!impl_->read_line_unsafe(&resp_line, &err)) {
+            throw std::runtime_error(err);
         }
         if (resp_line.empty()) {
             continue;
@@ -218,6 +242,11 @@ std::string EngineClient::wait_for_response(int expected_id, std::string* error_
             return resp_line;
         }
     }
+}
+
+EngineClient& EngineClient::instance() {
+    static EngineClient instance;
+    return instance;
 }
 
 } // namespace elbo_sdk

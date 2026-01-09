@@ -2,8 +2,10 @@
 
 #include "elbo_sdk/engine_client.h"
 
+#include <boost/json.hpp>
 #include <boost/process/search_path.hpp>
 
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
 #include <string>
@@ -11,72 +13,6 @@
 namespace bp = boost::process;
 
 namespace elbo_sdk {
-
-struct PivotEngineApi::Impl {
-    // EngineClient already has its own internal mutex, but we want to keep the
-    // higher-level API conservative and stable even if its internals change.
-    mutable std::mutex mu;
-    EngineClient client;
-};
-
-PivotEngineApi::PivotEngineApi() : impl_(new Impl()) {}
-
-PivotEngineApi::~PivotEngineApi() {
-    try {
-        stop();
-    } catch (...) {
-    }
-    delete impl_;
-    impl_ = nullptr;
-}
-
-bool PivotEngineApi::start(const std::string& engine_path, std::string* error_out) {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-
-    std::string resolved = engine_path;
-    if (resolved.empty()) {
-        resolved = resolve_engine_binary_path();
-    }
-
-    if (resolved.empty()) {
-        if (error_out) {
-            *error_out = "engine path not provided and could not be resolved";
-        }
-        return false;
-    }
-
-    return impl_->client.start(resolved, error_out);
-}
-
-void PivotEngineApi::stop() {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    impl_->client.stop();
-}
-
-bool PivotEngineApi::is_running() const {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->client.is_running();
-}
-
-std::string PivotEngineApi::send_command(const std::string& command_json, std::string* error_out) {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->client.send_command(command_json, error_out);
-}
-
-void PivotEngineApi::send_command_async(const std::string& command_json, std::string* error_out) {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    impl_->client.send_command_async(command_json, error_out);
-}
-
-std::string PivotEngineApi::wait_for_response(int expected_id, std::string* error_out) {
-    std::lock_guard<std::mutex> lock(impl_->mu);
-    return impl_->client.wait_for_response(expected_id, error_out);
-}
-
-PivotEngineApi& engine_singleton() {
-    static PivotEngineApi instance;
-    return instance;
-}
 
 std::string get_platform_id() {
     std::string system;
@@ -120,6 +56,36 @@ std::string resolve_engine_binary_path() {
     }
 
     return {};
+}
+
+std::string sync_license_mode_cpp() {
+    // Prefer the direct EngineClient-backed API for license sync.
+    return send_command(R"({"command": "get_edition"})");
+}
+
+// Static/free API forwarding to the internal EngineClient singleton.
+void start(const std::string& engine_path) {
+    EngineClient::instance().start(engine_path);
+}
+
+void stop() {
+    EngineClient::instance().stop();
+}
+
+bool is_running() {
+    return EngineClient::instance().is_running();
+}
+
+std::string send_command(const std::string& command_json) {
+    return EngineClient::instance().send_command(command_json);
+}
+
+void send_command_async(const std::string& command_json) {
+    EngineClient::instance().send_command_async(command_json);
+}
+
+std::string wait_for_response(int expected_id) {
+    return EngineClient::instance().wait_for_response(expected_id);
 }
 
 } // namespace elbo_sdk
