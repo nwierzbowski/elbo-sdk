@@ -3,7 +3,7 @@
 #include <cstddef>
 #include <string>
 
-#include "elbo_sdk/shm_bridge.h"
+#include "shm_bridge.h"
 
 namespace elbo_sdk {
 
@@ -19,8 +19,10 @@ public:
     void create(const std::string& name, std::size_t size);
     void open(const std::string& name);
 
+    // Combined create/open for Python wrapper simplicity
+    void create_or_open(const std::string& name, std::size_t size, bool create_mode);
+
     void close();
-    void unlink();
 
     bool is_closed() const;
 

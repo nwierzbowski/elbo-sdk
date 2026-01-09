@@ -1,5 +1,5 @@
 *.so
 *.pyd
 *.whl
-native/build
-native/*.egg-info
+build_wheel/build
+build_wheel/elbo_sdk.egg-info

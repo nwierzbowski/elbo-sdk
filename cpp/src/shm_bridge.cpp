@@ -80,12 +80,5 @@ void release_handle(SharedMemoryHandle* handle) {
     }
 }
 
-void remove_segment(const char* name) {
-#ifndef _WIN32
-    shared_memory_object::remove(name);
-#else
-    // Windows shared memory is automatically removed when the last handle is closed.
-    // No explicit removal needed/possible for windows_shared_memory.
-    (void)name; // Suppress unused parameter warning
-#endif
-}
+// remove_segment intentionally omitted from client SDK build.
+// Engine is responsible for unlinking named shared memory segments when appropriate.

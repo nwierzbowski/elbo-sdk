@@ -16,19 +16,14 @@ cdef class SharedMemory:
         self._closed = True
         self._seg = new SharedMemorySegment()
 
-        if create:
-            if name is None:
-                name_s = b""
-            else:
-                name_s = name.encode('utf-8')
-            self._seg.create(name_s, size)
-            self._created = True
+        # Use combined C++ method for simplicity
+        if name is None:
+            name_s = ""
         else:
-            if name is None:
-                raise ValueError("Name required when not creating")
             name_s = name.encode('utf-8')
-            self._seg.open(name_s)
-            self._created = False
+        
+        self._seg.create_or_open(name_s, size, create)
+        self._created = create
 
         self._name = (<bytes>self._seg.name()).decode('utf-8', 'replace')
         self._closed = self._seg.is_closed()
@@ -38,7 +33,7 @@ cdef class SharedMemory:
         try:
             if self._seg is not NULL:
                 if not self._closed:
-                    self.close()
+                    self._close()
         except Exception:
             pass
         if self._seg is not NULL:
@@ -68,13 +63,12 @@ cdef class SharedMemory:
     def __releasebuffer__(self, Py_buffer *buffer):
         pass
 
-    def close(self):
+    def _close(self):
         if not self._closed:
             self._seg.close()
             self._closed = True
 
-    def unlink(self):
-        self._seg.unlink()
+    # unlink() removed - engine manages shared memory lifecycle
         
     @property
     def name(self):
@@ -82,4 +76,4 @@ cdef class SharedMemory:
         
     @property
     def size(self):
-        return self._handle.size
+        return self._seg.size()

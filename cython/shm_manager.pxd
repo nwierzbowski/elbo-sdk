@@ -2,7 +2,7 @@ from libcpp.string cimport string
 from libc.stdint cimport uint32_t
 from libc.stddef cimport size_t
 
-cdef extern from "elbo_sdk/shm_manager_api.h" namespace "elbo_sdk":
+cdef extern from "shm_manager_api.h" namespace "elbo_sdk":
     cdef cppclass StandardizeSegmentsPlan:
         string uid
         string verts_name

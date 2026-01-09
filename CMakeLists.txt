@@ -19,12 +19,12 @@ _pivot_setup_boost()
 # -----------------------------------------------------------------------------
 
 add_library(elbo_sdk_cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_bridge.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/engine_client.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/engine_api.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/uid.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_manager_api.cpp
-  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/shm_segment.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/shm_bridge.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/engine_client.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/engine_api.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/uid.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/shm_manager_api.cpp
+  ${CMAKE_CURRENT_SOURCE_DIR}/cpp/src/shm_segment.cpp
 )
 
 set_target_properties(elbo_sdk_cpp PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -33,8 +33,7 @@ target_compile_features(elbo_sdk_cpp PUBLIC cxx_std_17)
 
 target_include_directories(elbo_sdk_cpp
   PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpp/include
 )
 
 if(Boost_FOUND)
@@ -45,6 +44,16 @@ endif()
 
 if(TARGET Boost::json)
   target_link_libraries(elbo_sdk_cpp PUBLIC Boost::json)
+endif()
+
+if(TARGET Boost::filesystem)
+  target_link_libraries(elbo_sdk_cpp PUBLIC Boost::filesystem)
+endif()
+if(TARGET Boost::system)
+  target_link_libraries(elbo_sdk_cpp PUBLIC Boost::system)
+endif()
+if(TARGET Boost::process)
+  target_link_libraries(elbo_sdk_cpp PUBLIC Boost::process)
 endif()
 
 # Build Cython Subdirectory

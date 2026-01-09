@@ -1,4 +1,4 @@
-#include "elbo_sdk/uid.h"
+#include "uid.h"
 
 #include <random>
 #include <string>

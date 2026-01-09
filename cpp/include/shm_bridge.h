@@ -17,4 +17,4 @@ struct SharedMemoryHandle {
 SharedMemoryHandle create_segment(const char* name, size_t size);
 SharedMemoryHandle open_segment(const char* name);
 void release_handle(SharedMemoryHandle* handle);
-void remove_segment(const char* name);
+// remove_segment is engine-only; client SDK does not provide unlinking.

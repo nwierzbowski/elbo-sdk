@@ -1,5 +1,5 @@
-#include "elbo_sdk/engine_client.h"
-#include "elbo_sdk/engine_api.h"
+#include "engine_client.h"
+#include "engine_api.h"
 
 #include <boost/json.hpp>
 #include <boost/process.hpp>

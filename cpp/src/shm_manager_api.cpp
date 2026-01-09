@@ -1,6 +1,6 @@
-#include "elbo_sdk/shm_manager_api.h"
+#include "shm_manager_api.h"
 
-#include "elbo_sdk/uid.h"
+#include "uid.h"
 
 #include <string>
 

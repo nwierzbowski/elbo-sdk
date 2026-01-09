@@ -30,9 +30,9 @@ from typing import Optional
 from libcpp.string cimport string
 
 # Direct C bindings to the static C API (delegates to EngineClient internally).
-cdef extern from "elbo_sdk/engine_api.h":
-    string get_platform_id "elbo_sdk::get_platform_id"() except +
-    string resolve_engine_binary_path "elbo_sdk::resolve_engine_binary_path"() except +
+cdef extern from "engine_api.h":
+    string cpp_get_platform_id "elbo_sdk::get_platform_id"() except +
+    string cpp_resolve_engine_binary_path "elbo_sdk::resolve_engine_binary_path"() except +
 
     void cpp_start "elbo_sdk::start"(string engine_path) except +
     void cpp_stop "elbo_sdk::stop"() except +
@@ -46,7 +46,9 @@ cdef extern from "elbo_sdk/engine_api.h":
 
 
 def get_platform_id() -> str:
-    cdef string s = get_platform_id()
+    print("Getting platform ID")
+    cdef string s = cpp_get_platform_id()
+    print("Platform ID:", (<bytes>s).decode('utf-8', 'replace'))
     return (<bytes>s).decode('utf-8', 'replace')
 
 
@@ -59,12 +61,12 @@ def get_engine_binary_path() -> str:
 
     Returns an empty string if no binary can be resolved.
     """
-    cdef string s = resolve_engine_binary_path()
+    cdef string s = cpp_resolve_engine_binary_path()
     return (<bytes>s).decode('utf-8', 'replace')
 
 
 def start(engine_path: Optional[str] = None) -> bool:
-    cpp_start(engine_path or "")
+    cpp_start(engine_path.encode('utf-8') or "")
     return True
 
 def stop() -> None:
@@ -74,6 +76,7 @@ def is_running() -> bool:
     return cpp_is_running()
 
 def send_command(dict command_dict) -> dict:
+    print("Sending command:", command_dict)
     payload = json.dumps(command_dict)
     resp_line = send_command(payload.encode('utf-8'))
 
@@ -81,6 +84,7 @@ def send_command(dict command_dict) -> dict:
     return json.loads(resp_py)
 
 def send_command_async(dict command_dict) -> None:
+    print("Sending async command:", command_dict)
     payload = json.dumps(command_dict)
     send_command_async(payload.encode('utf-8'))
 
@@ -99,6 +103,8 @@ def drop_groups(groups) -> int:
 
 def sync_license_mode() -> str:
     """Retrieve the compiled edition from the engine."""
+    print("Syncing license mode with engine...")
     result = sync_license_mode_cpp()
+
     return (<bytes>result).decode('utf-8', 'replace')
 
