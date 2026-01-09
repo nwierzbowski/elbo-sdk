@@ -38,7 +38,7 @@ target_include_directories(elbo_sdk_cpp
 
 if(Boost_FOUND)
   target_include_directories(elbo_sdk_cpp PUBLIC ${Boost_INCLUDE_DIRS})
-elseif(boost_ext_POPULATED)
+elseif(DEFINED boost_ext_SOURCE_DIR)
   target_include_directories(elbo_sdk_cpp PUBLIC ${boost_ext_SOURCE_DIR})
 endif()
 
