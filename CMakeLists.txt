@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.16)
 project(elbo_sdk LANGUAGES CXX)
 
 # Load common Pivot configuration
-include(${CMAKE_CURRENT_SOURCE_DIR}/pivot-cmake-common/cmake/PivotCommon.cmake)
+include(${pivot-cmake-common_SOURCE_DIR}/cmake/PivotCommon.cmake)
 
 pivot_common_define_targets()
 

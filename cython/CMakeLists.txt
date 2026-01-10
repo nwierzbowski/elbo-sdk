@@ -2,7 +2,7 @@
 # This file is part of the Pivot Bridge for Blender.
 
 # Load common configuration so the SDK can be used as a standalone package.
-include(${CMAKE_CURRENT_SOURCE_DIR}/../pivot-cmake-common/cmake/PivotCommon.cmake)
+include(${pivot-cmake-common_SOURCE_DIR}/cmake/PivotCommon.cmake)
 
 pivot_common_cython_find_python()
 
