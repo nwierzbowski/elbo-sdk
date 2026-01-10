@@ -1,16 +1,6 @@
 # Copyright (C) 2025 Nicholas Wierzbowski / Elbo Studio
 # This file is part of the Pivot Bridge for Blender.
 
-include(FetchContent)
-
-FetchContent_Declare(
-    pivot-cmake-common
-    GIT_REPOSITORY https://github.com/nwierzbowski/pivot-cmake-common.git  # Replace with actual repo URL
-    GIT_TAG master  # Replace with appropriate tag or commit
-)
-
-FetchContent_MakeAvailable(pivot-cmake-common)
-
 # Load common Pivot configuration
 include(${pivot-cmake-common_SOURCE_DIR}/cmake/PivotCommon.cmake)
 

@@ -7,7 +7,7 @@ include(FetchContent)
 FetchContent_Declare(
     pivot-cmake-common
     GIT_REPOSITORY https://github.com/nwierzbowski/pivot-cmake-common.git  # Replace with actual repo URL
-    GIT_TAG master  # Replace with appropriate tag or commit
+    GIT_TAG main  # Replace with appropriate tag or commit
 )
 
 FetchContent_MakeAvailable(pivot-cmake-common)
