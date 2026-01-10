@@ -2,6 +2,16 @@ cmake_minimum_required(VERSION 3.16)
 
 project(elbo_sdk LANGUAGES CXX)
 
+include(FetchContent)
+
+FetchContent_Declare(
+    pivot-cmake-common
+    GIT_REPOSITORY https://github.com/nwierzbowski/pivot-cmake-common.git  # Replace with actual repo URL
+    GIT_TAG master  # Replace with appropriate tag or commit
+)
+
+FetchContent_MakeAvailable(pivot-cmake-common)
+
 # Load common Pivot configuration
 include(${pivot-cmake-common_SOURCE_DIR}/cmake/PivotCommon.cmake)
 
