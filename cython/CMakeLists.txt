@@ -61,3 +61,11 @@ pivot_common_cython_create_wheel_target(
 foreach(_module IN LISTS _elbo_sdk_modules)
     target_link_libraries(${_module} PRIVATE elbo_sdk_cpp)
 endforeach()
+
+# Symlink to Blender site-packages for development
+pivot_common_cython_add_blender_symlink(
+    TARGET_NAME elbo_sdk_wheel
+    SOURCE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../build_wheel/build/lib.linux-x86_64-cpython-311/elbo_sdk"
+    PACKAGE_NAME elbo_sdk
+    BLENDER_SITE_PACKAGES "${BLENDER_SITE_PACKAGES}"
+)
