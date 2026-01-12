@@ -2,24 +2,29 @@
 #include "engine_api.h"
 
 #include <boost/json.hpp>
-#include <boost/process.hpp>
+#include <boost/process/v2.hpp>
+#include <boost/asio.hpp>
+#include <boost/filesystem.hpp>
 
 #include <chrono>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
-namespace bp = boost::process;
+namespace bp = boost::process::v2;
 namespace bj = boost::json;
+namespace asio = boost::asio;
 
 namespace elbo_sdk {
 
 struct EngineClient::Impl {
     std::mutex mu;
-    std::unique_ptr<bp::child> child;
-    std::unique_ptr<bp::opstream> in;
-    std::unique_ptr<bp::ipstream> out;
+    std::unique_ptr<asio::io_context> ctx;
+    std::unique_ptr<bp::process> child;
+    std::unique_ptr<asio::writable_pipe> in_pipe;
+    std::unique_ptr<asio::readable_pipe> out_pipe;
 
     bool is_running_unsafe() const {
         return child && child->running();
@@ -33,13 +38,13 @@ struct EngineClient::Impl {
     }
 
     bool write_line_unsafe(const std::string& line, std::string* error_out) {
-        if (!is_running_unsafe() || !in) {
+        if (!is_running_unsafe() || !in_pipe) {
             if (error_out) *error_out = "engine not running";
             return false;
         }
-        (*in) << line;
-        in->flush();
-        if (!(*in)) {
+        boost::system::error_code ec;
+        asio::write(*in_pipe, asio::buffer(line), ec);
+        if (ec) {
             if (error_out) *error_out = "failed writing to engine stdin";
             return false;
         }
@@ -47,16 +52,26 @@ struct EngineClient::Impl {
     }
 
     bool read_line_unsafe(std::string* line_out, std::string* error_out) {
-        if (!is_running_unsafe() || !out) {
+        if (!is_running_unsafe() || !out_pipe) {
             if (error_out) *error_out = "engine not running";
             return false;
         }
         std::string line;
-        if (!std::getline(*out, line)) {
+        boost::system::error_code ec;
+        std::size_t bytes = asio::read_until(*out_pipe, asio::dynamic_buffer(line), '\n', ec);
+        if (ec && ec != asio::error::eof) {
             if (error_out) *error_out = "failed reading from engine stdout";
             return false;
         }
-        *line_out = line;
+        if (bytes > 0) {
+            // Remove the newline
+            if (!line.empty() && line.back() == '\n') {
+                line.pop_back();
+            }
+            *line_out = line;
+        } else {
+            *line_out = "";
+        }
         return true;
     }
 };
@@ -86,26 +101,30 @@ void EngineClient::start(std::string engine_path) {
     }
 
     try {
-        impl_->in = std::make_unique<bp::opstream>();
-        impl_->out = std::make_unique<bp::ipstream>();
+        impl_->ctx = std::make_unique<asio::io_context>();
+        impl_->in_pipe = std::make_unique<asio::writable_pipe>(*impl_->ctx);
+        impl_->out_pipe = std::make_unique<asio::readable_pipe>(*impl_->ctx);
 
-        impl_->child = std::make_unique<bp::child>(
-            resolved,
-            bp::std_in < *impl_->in,
-            bp::std_out > *impl_->out
+        impl_->child = std::make_unique<bp::process>(
+            impl_->ctx->get_executor(),
+            boost::filesystem::path(resolved),
+            std::vector<std::string>{},
+            bp::process_stdio{*impl_->in_pipe, *impl_->out_pipe, {}}
         );
 
         if (!impl_->child->running()) {
             impl_->child.reset();
-            impl_->in.reset();
-            impl_->out.reset();
+            impl_->ctx.reset();
+            impl_->in_pipe.reset();
+            impl_->out_pipe.reset();
             throw std::runtime_error("engine process did not start");
         }
 
     } catch (const std::exception& e) {
         impl_->child.reset();
-        impl_->in.reset();
-        impl_->out.reset();
+        impl_->ctx.reset();
+        impl_->in_pipe.reset();
+        impl_->out_pipe.reset();
         throw std::runtime_error(e.what());
     }
 }
@@ -123,9 +142,13 @@ void EngineClient::stop() {
             (void)impl_->write_line_unsafe("__quit__\n", &err);
 
             // Best-effort graceful shutdown.
-            if (!impl_->child->wait_for(std::chrono::milliseconds(2000))) {
+            impl_->child->request_exit();
+            // Wait for a short time
+            std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+            if (impl_->child->running()) {
                 impl_->child->terminate();
-                if (!impl_->child->wait_for(std::chrono::milliseconds(1000))) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                if (impl_->child->running()) {
                     impl_->child->terminate();
                 }
             }
@@ -143,8 +166,9 @@ void EngineClient::stop() {
     }
 
     impl_->child.reset();
-    impl_->in.reset();
-    impl_->out.reset();
+    impl_->ctx.reset();
+    impl_->in_pipe.reset();
+    impl_->out_pipe.reset();
 }
 
 bool EngineClient::is_running() const {

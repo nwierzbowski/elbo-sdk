@@ -1,6 +1,2 @@
-*.so
-*.pyd
-*.whl
-build_wheel/build
-build_wheel/elbo_sdk.egg-info
 __pycache__
+/dist
