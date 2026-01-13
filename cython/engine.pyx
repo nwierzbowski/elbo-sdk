@@ -29,6 +29,12 @@ from typing import Optional
 
 from libcpp.string cimport string
 
+COMMAND_SET_SURFACE_TYPES = 4
+COMMAND_DROP_GROUPS = 5
+COMMAND_CLASSIFY_GROUPS = 1
+COMMAND_CLASSIFY_OBJECTS = 1
+COMMAND_GET_GROUP_SURFACE_TYPES = 2
+
 # Direct C bindings to the static C API (delegates to EngineClient internally).
 cdef extern from "engine_api.h":
     string cpp_get_platform_id "elbo_sdk::get_platform_id"() except +
@@ -38,9 +44,9 @@ cdef extern from "engine_api.h":
     void cpp_stop "elbo_sdk::stop"() except +
     bint cpp_is_running "elbo_sdk::is_running"() except +
 
-    string send_command "elbo_sdk::send_command"(const string& command_json) except +
-    void send_command_async "elbo_sdk::send_command_async"(const string& command_json) except +
-    string wait_for_response "elbo_sdk::wait_for_response"(int expected_id) except +
+    string cpp_send_command "elbo_sdk::send_command"(const string& command_json) except +
+    void cpp_send_command_async "elbo_sdk::send_command_async"(const string& command_json) except +
+    string cpp_wait_for_response "elbo_sdk::wait_for_response"(int expected_id) except +
 
     string sync_license_mode_cpp "elbo_sdk::sync_license_mode_cpp"() except +
 
@@ -78,7 +84,7 @@ def is_running() -> bool:
 def send_command(dict command_dict) -> dict:
     print("Sending command:", command_dict)
     payload = json.dumps(command_dict)
-    resp_line = send_command(payload.encode('utf-8'))
+    resp_line = cpp_send_command(payload.encode('utf-8'))
 
     resp_py = (<bytes>resp_line).decode('utf-8', 'replace')
     return json.loads(resp_py)
@@ -86,10 +92,10 @@ def send_command(dict command_dict) -> dict:
 def send_command_async(dict command_dict) -> None:
     print("Sending async command:", command_dict)
     payload = json.dumps(command_dict)
-    send_command_async(payload.encode('utf-8'))
+    cpp_send_command_async(payload.encode('utf-8'))
 
 def wait_for_response(int expected_id) -> dict:
-    resp_line = wait_for_response(expected_id)
+    resp_line = cpp_wait_for_response(expected_id)
 
     resp_py = (<bytes>resp_line).decode('utf-8', 'replace')
     return json.loads(resp_py)
@@ -106,5 +112,167 @@ def sync_license_mode() -> str:
     print("Syncing license mode with engine...")
     result = sync_license_mode_cpp()
 
-    return (<bytes>result).decode('utf-8', 'replace')
+    s = (<bytes>result).decode('utf-8', 'replace')
+    try:
+        data = json.loads(s)
+        return data.get("engine_edition", "unknown")
+    except Exception:
+        return s
 
+def build_standardize_groups_command(verts_shm_name: str, edges_shm_name: str, 
+                                    rotations_shm_name: str, scales_shm_name: str, 
+                                    offsets_shm_name: str, vert_counts: list, 
+                                    edge_counts: list, object_counts: list, 
+                                    group_names: list, surface_contexts: list[str]) -> Dict[str, Any]:
+    """Build a standardize_groups command for the engine (Pro edition).
+    
+    Args:
+        verts_shm_name: Shared memory name for vertex data
+        edges_shm_name: Shared memory name for edge data
+        rotations_shm_name: Shared memory name for rotation data
+        scales_shm_name: Shared memory name for scale data
+        offsets_shm_name: Shared memory name for offset data
+        vert_counts: List of vertex counts per group
+        edge_counts: List of edge counts per group
+        object_counts: List of object counts per group
+        group_names: List of group names to standardize
+        surface_context: Surface context for standardization
+        
+    Returns:
+        Dict containing the command structure
+    """
+    return {
+        "id": COMMAND_CLASSIFY_GROUPS,
+        "op": "standardize_groups",
+        "shm_verts": verts_shm_name,
+        "shm_edges": edges_shm_name,
+        "shm_rotations": rotations_shm_name,
+        "shm_scales": scales_shm_name,
+        "shm_offsets": offsets_shm_name,
+        "vert_counts": vert_counts,
+        "edge_counts": edge_counts,
+        "object_counts": object_counts,
+        "group_names": group_names,
+        "surface_contexts": surface_contexts,
+    }
+
+def build_standardize_synced_groups_command(group_names: list[str], surface_contexts: list[str]) -> Dict[str, Any]:
+    """Build a command to reclassify already-synced groups without uploading mesh data."""
+    return {
+        "id": COMMAND_CLASSIFY_GROUPS,
+        "op": "standardize_synced_groups",
+        "group_names": group_names,
+        "surface_contexts": surface_contexts
+    }
+
+def build_standardize_objects_command(verts_shm_name: str, edges_shm_name: str,
+                                    rotations_shm_name: str, scales_shm_name: str,
+                                    offsets_shm_name: str, vert_counts: list,
+                                    edge_counts: list, object_names: list, surface_contexts: list[str]) -> Dict[str, Any]:
+    """Build a standardize_objects command for the engine.
+    
+    Args:
+        verts_shm_name: Shared memory name for vertex data
+        edges_shm_name: Shared memory name for edge data
+        rotations_shm_name: Shared memory name for rotation data
+        scales_shm_name: Shared memory name for scale data
+        offsets_shm_name: Shared memory name for offset data
+        vert_counts: List of vertex counts per object
+        edge_counts: List of edge counts per object
+        object_names: List of object names to standardize
+        surface_contexts: Per-object surface context strings
+        
+    Returns:
+        Dict containing the command structure
+    """
+    return {
+        "id": COMMAND_CLASSIFY_OBJECTS,
+        "op": "standardize_objects",
+        "shm_verts": verts_shm_name,
+        "shm_edges": edges_shm_name,
+        "shm_rotations": rotations_shm_name,
+        "shm_scales": scales_shm_name,
+        "shm_offsets": offsets_shm_name,
+        "vert_counts": vert_counts,
+        "edge_counts": edge_counts,
+        "object_names": object_names,
+        "surface_contexts": surface_contexts
+    }
+
+def send_group_classifications(group_surface_map: Dict[str, Any]) -> bool:
+    """Send a batch classification update to the engine."""
+    if not group_surface_map:
+        return True
+
+    if not is_running():
+        return False
+
+    payload = []
+    for name, value in group_surface_map.items():
+        try:
+            surface_int = int(value)
+        except (TypeError, ValueError):
+            continue
+        payload.append({"group_name": name, "surface_type": surface_int})
+
+    if not payload:
+        return True
+
+    try:
+        command = {
+            "id": COMMAND_SET_SURFACE_TYPES,
+            "op": "set_surface_types",
+            "classifications": payload
+        }
+        response = send_command(command)
+        if not response.get("ok", False):
+            error = response.get("error", "Unknown error")
+            print(f"Failed to update group classifications: {error}")
+            return False
+        return True
+    except Exception as exc:
+        print(f"Error sending group classifications: {exc}")
+        return False
+
+def drop_groups(group_names: list[str]) -> int:
+    """Drop groups from the engine cache.
+
+    Args:
+        group_names: List of group names to drop from the cache
+
+    Returns:
+        int: Number of groups actually dropped, or -1 on error
+    """
+    if not group_names:
+        return 0
+
+    if not is_running():
+        return -1
+
+    try:
+        command = {
+            "id": COMMAND_DROP_GROUPS,
+            "op": "drop_groups",
+            "group_names": group_names
+        }
+        response = send_command(command)
+        if not response.get("ok", False):
+            error = response.get("error", "Unknown error")
+            print(f"Failed to drop groups from engine: {error}")
+            return -1
+        dropped_count = response.get("dropped_count", 0)
+        return dropped_count
+    except Exception as exc:
+        print(f"Error dropping groups from engine: {exc}")
+        return -1    
+
+def build_get_surface_types_command() -> Dict[str, Any]:
+    """Build a get_surface_types command for the engine.
+    
+    Returns:
+        Dict containing the command structure
+    """
+    return {
+        "id": COMMAND_GET_GROUP_SURFACE_TYPES,
+        "op": "get_surface_types"
+    }
