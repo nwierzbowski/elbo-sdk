@@ -1,7 +1,23 @@
 # Copyright (C) 2025 Nicholas Wierzbowski / Elbo Studio
 # This file is part of the Pivot Bridge for Blender.
 # Find python for Cython module
+
+#Find and add cython_cmake to module path
+if(NOT PIVOT_DEV)
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -c "import cython_cmake, os; print(os.path.join(os.path.dirname(cython_cmake.__file__), 'cmake'))"
+    OUTPUT_VARIABLE CYTHON_CMAKE_DIR
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+# Add that directory to your search path
+list(APPEND CMAKE_MODULE_PATH "${CYTHON_CMAKE_DIR}")
+endif()
+
+
 find_package(Python COMPONENTS Interpreter Development.Module NumPy REQUIRED)
+find_package(Cython REQUIRED MODULE)
+include(UseCython)
 
 set(ELBO_SDK_STAGING_DIR "${CMAKE_CURRENT_BINARY_DIR}/staging/elbo_sdk")
 
@@ -13,13 +29,6 @@ configure_file(
 )
 
 # Set defines for C++ code based on flags
-set(_elbo_edition_defines)
-if(PIVOT_EDITION STREQUAL "PRO")
-    list(APPEND _elbo_edition_defines PIVOT_EDITION_PRO)
-else()
-    list(APPEND _elbo_edition_defines PIVOT_EDITION_STANDARD)
-endif()
-list(APPEND _elbo_edition_defines PIVOT_EDITION_NAME="${PIVOT_EDITION}")
 
 set(ELBO_SDK_MODULE_NAMES
     engine
@@ -30,16 +39,16 @@ set(ELBO_SDK_MODULE_NAMES
 set(_elbo_sdk_targets)
 foreach(_module IN LISTS ELBO_SDK_MODULE_NAMES)
     set(_module_src "${CMAKE_CURRENT_SOURCE_DIR}/${_module}.pyx")
-    python_add_library(elbo_sdk_${_module} MODULE WITH_SOABI ${_module_src})
-    set_target_properties(elbo_sdk_${_module} PROPERTIES
+
+    cython_transpile("${_module_src}" LANGUAGE CXX OUTPUT_VARIABLE _generated_c)
+
+    python_add_library(${_module} MODULE WITH_SOABI ${_generated_c})
+    set_target_properties(${_module} PROPERTIES
         LIBRARY_OUTPUT_DIRECTORY "${ELBO_SDK_STAGING_DIR}"
     )
-    target_link_libraries(elbo_sdk_${_module} PRIVATE elbo_sdk_cpp Python::Module Python::NumPy)
-
-    target_compile_definitions(elbo_sdk_${_module} PRIVATE ${_elbo_edition_defines})
-    target_compile_features(elbo_sdk_${_module} PRIVATE cxx_std_17)
-    install(TARGETS elbo_sdk_${_module} LIBRARY DESTINATION elbo_sdk)
-    list(APPEND _elbo_sdk_targets elbo_sdk_${_module})
+    target_link_libraries(${_module} PRIVATE elbo_sdk_cpp Python::Module Python::NumPy pivot_common::base_cython)
+    install(TARGETS ${_module} LIBRARY DESTINATION elbo_sdk)
+    list(APPEND _elbo_sdk_targets ${_module})
 endforeach()
 
 

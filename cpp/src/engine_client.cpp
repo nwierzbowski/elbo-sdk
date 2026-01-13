@@ -1,10 +1,13 @@
 #include "engine_client.h"
 #include "engine_api.h"
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 #include <boost/json.hpp>
 #include <boost/process/v2.hpp>
 #include <boost/asio.hpp>
 #include <boost/filesystem.hpp>
+#pragma GCC diagnostic pop
 
 #include <chrono>
 #include <memory>
