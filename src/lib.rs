@@ -73,7 +73,7 @@ mod elbo_sdk_rust {
 
     #[pyfunction]
     fn poll_mesh_sync() -> PyResult<Option<AssetSyncContext>> {
-        let asset_data_slices = match engine_api::poll_mesh_sync() {
+        let context = match engine_api::poll_mesh_sync() {
             Ok(Some(slices)) => slices,
             Ok(None) => return Ok(None),
             Err(e) => {
@@ -83,10 +83,7 @@ mod elbo_sdk_rust {
             }
         };
 
-        Ok(Some(AssetSyncContext {
-            asset_slices: asset_data_slices,
-            asset_ptrs: None,
-        }))
+        Ok(Some(context))
     }
 
     #[pyfunction]
@@ -100,7 +97,7 @@ mod elbo_sdk_rust {
         surface_contexts: Vec<u16>,
         asset_uuids: Vec<Uuid>,
     ) -> PyResult<AssetSyncContext> {
-        let (asset_slices, asset_ptrs) = engine_api::allocate_memory(
+        let context = engine_api::allocate_memory(
             vert_counts,
             edge_counts,
             loop_counts,
@@ -112,10 +109,7 @@ mod elbo_sdk_rust {
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        Ok(AssetSyncContext {
-            asset_slices,
-            asset_ptrs: Some(asset_ptrs),
-        })
+        Ok(context)
     }
 
     #[pyfunction]

@@ -1,6 +1,6 @@
-use pivot_com_types::{asset_meta::AssetDataSlices, asset_ptr::AssetPtr};
+use pivot_com_types::{asset_meta::{AssetDataSlices, AssetMeta}, asset_ptr::AssetPtr};
 use pyo3::{ffi, prelude::*};
-use std::os::raw::c_char;
+use std::{os::raw::c_char, ptr::NonNull};
 
 use crate::engine_api;
 
@@ -8,8 +8,20 @@ use crate::engine_api;
 
 #[pyclass(unsendable)]
 pub struct AssetSyncContext {
-    pub asset_slices: Vec<AssetDataSlices>,
-    pub asset_ptrs: Option<Vec<AssetPtr>>,
+    asset_slices: Vec<AssetDataSlices>,
+    asset_ptrs: Option<Vec<AssetPtr>>,
+}
+
+impl AssetSyncContext {
+    pub fn new(ptrs: Vec<NonNull<AssetMeta>>, asset_ptrs:  &[AssetPtr]) -> AssetSyncContext {
+        let mut asset_slices = Vec::with_capacity(ptrs.len());
+
+        for mut ptr in ptrs {
+            asset_slices.push(unsafe{ ptr.as_mut().get_slices()})
+        };
+
+        AssetSyncContext { asset_slices, asset_ptrs: Some(asset_ptrs.to_vec()) }
+    }
 }
 
 #[pymethods]

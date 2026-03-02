@@ -8,12 +8,12 @@ use pivot_com_types::OP_SET_SURFACE_TYPES;
 use pivot_com_types::OP_STANDARDIZE_GROUPS;
 use pivot_com_types::OP_STANDARDIZE_SYNCED_GROUPS;
 use pivot_com_types::alloc::AllocRequestMeta;
-use pivot_com_types::asset_meta::AssetDataSlices;
 use pivot_com_types::asset_meta::AssetMeta;
 use pivot_com_types::asset_ptr::AssetPtr;
 use pivot_com_types::asset_surface::GroupSurface;
 use pivot_com_types::fields::Uuid;
 
+use crate::asset_sync_context::AssetSyncContext;
 use crate::engine_client::EngineClient;
 use std::collections::HashMap;
 use std::env;
@@ -44,7 +44,7 @@ pub fn generate_uuid_bytes() -> [u8; 16] {
     unsafe { *ptr }
 }
 
-pub fn poll_mesh_sync() -> Result<Option<Vec<AssetDataSlices>>, String> {
+pub fn poll_mesh_sync() -> Result<Option<AssetSyncContext>, String> {
     let mp = match CLIENT.poll_mesh_sync() {
         Ok(Some(mp)) => mp,
         Ok(None) => return Ok(None),
@@ -56,13 +56,7 @@ pub fn poll_mesh_sync() -> Result<Option<Vec<AssetDataSlices>>, String> {
         .to_asset_meta_ptr(mp.header.num_items as usize);
     let ptrs = CLIENT.hydrate_ptrs(&asset_ptrs, &mp.header.root_slab_handle)?;
 
-    let mut asset_slices = Vec::new();
-    for mut ptr in ptrs {
-        let slice = unsafe { ptr.as_mut().get_slices()};
-        asset_slices.push(slice);
-    }
-
-    Ok(Some(asset_slices))
+    Ok(Some(AssetSyncContext::new(ptrs, asset_ptrs)))
 }
 
 ///Requests memory for the provided asset mettadata and writes the group names and asset mettas into the correct places
@@ -75,10 +69,10 @@ pub fn allocate_memory(
     group_names: Vec<String>,
     surface_contexts: Vec<u16>,
     asset_uuids: Vec<Uuid>,
-) -> Result<(Vec<AssetDataSlices>, Vec<AssetPtr>), String> {
+) -> Result<AssetSyncContext, String> {
     let count = asset_uuids.len();
 
-    let mut asset_slices = Vec::with_capacity(count);
+    // let mut asset_slices = Vec::with_capacity(count);
     let mut sizes = Vec::with_capacity(count);
     let mut asset_metas = Vec::with_capacity(count);
 
@@ -111,7 +105,7 @@ pub fn allocate_memory(
     let ptrs = CLIENT.hydrate_ptrs(&asset_ptrs, &resp.header.root_slab_handle)?;
 
     //Write group names and meta datas into the provided memory
-    for ((mut ptr, asset_meta), group_name) in zip(ptrs, asset_metas).zip(group_names) {
+    for ((ptr, asset_meta), group_name) in zip(&ptrs, asset_metas).zip(group_names) {
         // Copy the AssetMeta into the shared memory
         unsafe {
             let raw_ptr = ptr.as_ptr();
@@ -123,13 +117,8 @@ pub fn allocate_memory(
             //Copy meta into memory
             std::ptr::copy_nonoverlapping(group_name.as_ptr(), name_dest, group_name.len());
         };
-
-        //Constructs slices over each of the data parts
-        let asset_data_slices = unsafe{ ptr.as_mut().get_slices()};
-        // asset_ptrs.push(asset_ptr);
-        asset_slices.push(asset_data_slices);
     }
-    Ok((asset_slices, asset_ptrs.to_vec()))
+    Ok(AssetSyncContext::new(ptrs, asset_ptrs))
 }
 
 pub fn standardize_groups_command(meta_vec: Vec<AssetPtr>) -> Result<EngineResponse, String> {
