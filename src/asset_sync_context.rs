@@ -2,7 +2,7 @@ use pivot_com_types::{
     asset_meta::{AssetDataSlices, AssetMeta},
     asset_ptr::AssetPtr, fields::Uuid,
 };
-use pyo3::{ffi, prelude::*};
+use pyo3::{ffi, prelude::*, types::PyByteArray};
 use std::{os::raw::c_char, ptr::NonNull};
 
 use crate::engine_api;
@@ -12,22 +12,26 @@ pub struct AssetSyncContext {
     asset_slices: Vec<AssetDataSlices>,
     asset_ptrs: Vec<AssetPtr>,
     asset_uuids: Vec<Uuid>,
+    asset_surface_contexts: Vec<u16>
 }
 
 impl AssetSyncContext {
     pub fn new(ptrs: Vec<NonNull<AssetMeta>>, asset_ptrs: &[AssetPtr]) -> AssetSyncContext {
         let mut asset_slices = Vec::with_capacity(ptrs.len());
         let mut asset_uuids = Vec::with_capacity(ptrs.len());
+        let mut asset_surface_contexts = Vec::with_capacity(ptrs.len());
 
         for mut ptr in ptrs {
             asset_slices.push(unsafe { ptr.as_mut().get_slices() });
             asset_uuids.push(unsafe {ptr.as_mut().uuid});
+            asset_surface_contexts.push(unsafe {ptr.as_mut().surface_context});
         }
 
         AssetSyncContext {
             asset_slices,
             asset_ptrs: asset_ptrs.to_vec(),
             asset_uuids,
+            asset_surface_contexts,
         }
     }
 }
@@ -35,13 +39,20 @@ impl AssetSyncContext {
 #[pymethods]
 impl AssetSyncContext {
     pub fn uuids(&self, py: Python) -> PyResult<Py<PyAny>> {
-        // Flatten Uuid array into a single byte slice (16 bytes per UUID)
         let flattened: Vec<u8> = self.asset_uuids.iter()
             .flat_map(|uuid| uuid.bytes.iter())
             .copied()
             .collect();
 
-        memoryview_from_slice_ref(py, &flattened)
+        Ok(PyByteArray::new(py, &flattened).into_any().unbind())
+    }
+
+    pub fn surface_contexts(&self, py: Python) -> PyResult<Py<PyAny>> {
+        let flattened: Vec<u8> = self.asset_surface_contexts.iter()
+            .flat_map(|c| c.to_le_bytes())
+            .collect();
+
+        Ok(PyByteArray::new(py, &flattened).into_any().unbind())
     }
 
     pub fn buffers(
@@ -116,14 +127,3 @@ fn memoryview_from_slice(py: Python, slice_ptr: *mut [u8]) -> PyResult<Py<PyAny>
     Ok(unsafe { Py::from_owned_ptr(py, mv) })
 }
 
-fn memoryview_from_slice_ref<'a>(py: Python<'a>, slice: &'a [u8]) -> PyResult<Py<PyAny>> {
-    let ptr = slice.as_ptr() as *mut c_char;
-    let len = slice.len() as isize;
-    let mv = unsafe { ffi::PyMemoryView_FromMemory(ptr, len, ffi::PyBUF_WRITE) };
-    if mv.is_null() {
-        return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-            "failed to create memoryview from slice",
-        ));
-    }
-    Ok(unsafe { Py::from_owned_ptr(py, mv) })
-}
