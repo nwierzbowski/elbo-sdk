@@ -112,6 +112,7 @@ pub fn allocate_memory(
             //Write meta into memory
             std::ptr::write_unaligned(raw_ptr, asset_meta);
 
+            
             //Copy name into memory
             std::ptr::copy_nonoverlapping(group_name.as_ptr(), name_dest, group_name.len());
         };
