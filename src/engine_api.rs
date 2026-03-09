@@ -121,15 +121,30 @@ pub fn allocate_memory(
     Ok(AssetSyncContext::new(ptrs, asset_ptrs))
 }
 
-pub fn standardize_groups_command(meta_vec: Vec<AssetPtr>, should_cache: bool) -> Result<EngineResponse, String> {
+pub fn send_mesh_command(meta_vec: Vec<AssetPtr>) -> Result<EngineResponse, String> {
     let mut command = EngineCommand {
-        should_cache: should_cache as u16,
-        op_id: OP_STANDARDIZE_GROUPS,
+        should_cache: 0,
+        op_id: pivot_com_types::OP_SEND_MESH,
         num_headers: meta_vec.len() as u32,
         inline_data: Buffer::new(),
     };
 
     command.inline_data.copy_payload(&meta_vec, 0);
+
+    CLIENT.send_command(command)
+}
+
+pub fn standardize_groups_command(uuids: Vec<Uuid>) -> Result<EngineResponse, String> {
+    let count = uuids.len() as u32;
+
+    let mut command = EngineCommand {
+        should_cache: 0,
+        op_id: OP_STANDARDIZE_GROUPS,
+        num_headers: count,
+        inline_data: Buffer::new(),
+    };
+
+    command.inline_data.copy_payload(&uuids, 0);
 
     CLIENT.send_command(command)
 }

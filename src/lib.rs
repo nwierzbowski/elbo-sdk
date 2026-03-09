@@ -90,7 +90,7 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn prepare_standardize_groups(
+    fn prepare_mesh_send(
         vert_counts: Vec<u32>,
         edge_counts: Vec<u32>,
         loop_counts: Vec<u32>,
@@ -113,6 +113,12 @@ mod elbo_sdk_rust {
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
         Ok(context)
+    }
+
+    #[pyfunction]
+    fn standardize_groups_command(uuids: Vec<Uuid>) -> () {
+        let _ = engine_api::standardize_groups_command(uuids)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
     }
 
     #[pyfunction]
