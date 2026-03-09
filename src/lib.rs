@@ -58,6 +58,12 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
+    fn extract_geometric_features_command(uuids: Vec<Uuid>) -> () {
+        let _ = engine_api::extract_geometric_features_command(uuids)
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    }
+
+    #[pyfunction]
     fn get_platform_id() -> PyResult<String> {
         Ok(crate::engine_api::get_platform_id())
     }

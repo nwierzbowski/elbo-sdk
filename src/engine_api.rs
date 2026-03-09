@@ -2,6 +2,7 @@ use pivot_com_types::Buffer;
 use pivot_com_types::EngineCommand;
 use pivot_com_types::EngineResponse;
 use pivot_com_types::OP_DROP_GROUPS;
+use pivot_com_types::OP_EXTRACT_GEOMETRIC_FEATURES;
 use pivot_com_types::OP_GET_SURFACE_TYPES;
 use pivot_com_types::OP_ORGANIZE_OBJECTS;
 use pivot_com_types::OP_SET_SURFACE_TYPES;
@@ -229,6 +230,23 @@ pub fn organize_objects_command() -> Result<EngineResponse, String> {
         num_headers: 0,
         inline_data: Buffer::new(),
     };
+
+    CLIENT.send_command(command)
+}
+
+pub fn extract_geometric_features_command(
+    uuids: Vec<Uuid>,
+) -> Result<EngineResponse, String> {
+    let count = uuids.len() as u32;
+
+    let mut command = EngineCommand {
+        should_cache: 1,
+        op_id: OP_EXTRACT_GEOMETRIC_FEATURES,
+        num_headers: count,
+        inline_data: Buffer::new(),
+    };
+
+    command.inline_data.copy_payload(&uuids, 0);
 
     CLIENT.send_command(command)
 }
