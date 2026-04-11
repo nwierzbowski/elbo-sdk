@@ -5,7 +5,7 @@ use iceoryx2_bb_posix::shared_memory::{SharedMemory, SharedMemoryBuilder};
 use pivot_com_types::alloc::SlabRegistry;
 use pivot_com_types::asset_meta::AssetMeta;
 use pivot_com_types::asset_ptr::AssetPtr;
-use pivot_com_types::{Buffer, EngineCommand, EngineResponse, MeshPublish, OP_STOP_ENGINE};
+use pivot_com_types::{EngineCommand, EngineResponse, MeshPublish};
 use std::process::Child;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -115,12 +115,7 @@ impl EngineClient {
             }
         }
 
-        let command = EngineCommand {
-            should_cache: 1,
-            op_id: OP_STOP_ENGINE,
-            num_headers: 0,
-            inline_data: Buffer::new(),
-        };
+        let command = EngineCommand::stop_engine();
         let res = self.send_command(command);
 
         let mut guard = self.state.lock().unwrap();
