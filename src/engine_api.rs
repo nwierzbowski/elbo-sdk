@@ -168,6 +168,26 @@ pub fn get_surface_types_command() -> Result<EngineResponse, String> {
     CLIENT.send_command(command)
 }
 
+pub fn export_assets_command(
+    path: &str,
+    target_bytes: u32,
+    uuids: Vec<Uuid>,
+) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_assets(path, target_bytes, &uuids);
+    CLIENT.send_command(command)
+}
+
+pub fn export_all_command(path: &str, target_bytes: u32) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_all(path, target_bytes);
+    CLIENT.send_command(command)
+}
+
+pub fn import_assets_command(paths: Vec<String>) -> Result<EngineResponse, String> {
+    let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+    let command = EngineCommand::import_assets(&path_refs);
+    CLIENT.send_command(command)
+}
+
 pub fn set_engine_dir(path: PathBuf) {
     let mut guard = ENGINE_DIR
         .lock()

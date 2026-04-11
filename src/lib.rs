@@ -150,4 +150,33 @@ mod elbo_sdk_rust {
     fn generate_uuid_bytes() -> PyResult<[u8; 16]> {
         Ok(engine_api::generate_uuid_bytes())
     }
+
+    #[pyfunction]
+    fn export_assets_command(
+        py: Python,
+        path: String,
+        target_bytes: u32,
+        uuids: Vec<Uuid>,
+    ) -> () {
+        py.detach(|| {
+            let _ = engine_api::export_assets_command(&path, target_bytes, uuids)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+        });
+    }
+
+    #[pyfunction]
+    fn export_all_command(py: Python, path: String, target_bytes: u32) -> () {
+        py.detach(|| {
+            let _ = engine_api::export_all_command(&path, target_bytes)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+        });
+    }
+
+    #[pyfunction]
+    fn import_assets_command(py: Python, paths: Vec<String>) -> () {
+        py.detach(|| {
+            let _ = engine_api::import_assets_command(paths)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+        });
+    }
 }
