@@ -155,7 +155,7 @@ mod elbo_sdk_rust {
     fn export_assets_command(
         py: Python,
         path: String,
-        target_bytes: u32,
+        target_bytes: u64,
         uuids: Vec<Uuid>,
     ) -> () {
         py.detach(|| {
@@ -165,7 +165,7 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn export_all_command(py: Python, path: String, target_bytes: u32) -> () {
+    fn export_all_command(py: Python, path: String, target_bytes: u64) -> () {
         py.detach(|| {
             let _ = engine_api::export_all_command(&path, target_bytes)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));

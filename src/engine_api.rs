@@ -170,14 +170,14 @@ pub fn get_surface_types_command() -> Result<EngineResponse, String> {
 
 pub fn export_assets_command(
     path: &str,
-    target_bytes: u32,
+    target_bytes: u64,
     uuids: Vec<Uuid>,
 ) -> Result<EngineResponse, String> {
     let command = EngineCommand::export_assets(path, target_bytes, &uuids);
     CLIENT.send_command(command)
 }
 
-pub fn export_all_command(path: &str, target_bytes: u32) -> Result<EngineResponse, String> {
+pub fn export_all_command(path: &str, target_bytes: u64) -> Result<EngineResponse, String> {
     let command = EngineCommand::export_all(path, target_bytes);
     CLIENT.send_command(command)
 }
