@@ -173,6 +173,20 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
+    fn export_tbo_command(
+        py: Python,
+        path: String,
+        target_bytes: u64,
+        flags: u32,
+        uuids: Vec<Uuid>,
+    ) -> () {
+        py.detach(|| {
+            let _ = engine_api::export_tbo_command(&path, target_bytes, flags, uuids)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+        });
+    }
+
+    #[pyfunction]
     fn import_assets_command(py: Python, paths: Vec<String>) -> () {
         py.detach(|| {
             let _ = engine_api::import_assets_command(paths)

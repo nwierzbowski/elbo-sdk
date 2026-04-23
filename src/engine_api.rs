@@ -182,6 +182,16 @@ pub fn export_all_command(path: &str, target_bytes: u64) -> Result<EngineRespons
     CLIENT.send_command(command)
 }
 
+pub fn export_tbo_command(
+    path: &str,
+    target_bytes: u64,
+    flags: u32,
+    uuids: Vec<Uuid>,
+) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_tbo(path, target_bytes, flags, &uuids);
+    CLIENT.send_command(command)
+}
+
 pub fn import_assets_command(paths: Vec<String>) -> Result<EngineResponse, String> {
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let command = EngineCommand::import_assets(&path_refs);
