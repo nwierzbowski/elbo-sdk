@@ -221,6 +221,21 @@ pub fn import_assets_command(paths: Vec<String>) -> Result<EngineResponse, Strin
     CLIENT.send_command(command)
 }
 
+pub fn tbo_config_command(channel_mask: u32, target_point_count: u32) -> Result<EngineResponse, String> {
+    let command = EngineCommand::tbo_config(channel_mask, target_point_count);
+    CLIENT.send_command(command)
+}
+
+pub fn tbo_downsample_command(uuids: Vec<Uuid>) -> Result<EngineResponse, String> {
+    let command = EngineCommand::tbo_downsample(&uuids);
+    CLIENT.send_command(command)
+}
+
+pub fn tbo_flush_command(path: &str, target_bytes: u64, batch_offset: u32) -> Result<EngineResponse, String> {
+    let command = EngineCommand::tbo_flush(path, target_bytes, batch_offset);
+    CLIENT.send_command(command)
+}
+
 pub fn set_engine_dir(path: PathBuf) {
     let mut guard = ENGINE_DIR
         .lock()

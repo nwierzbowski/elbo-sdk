@@ -3,6 +3,7 @@ mod command_thread;
 mod engine_api;
 mod engine_client; // This line remains unchanged
 mod mesh_sync_thread;
+mod tbo_export_context;
 extern crate iceoryx2_loggers;
 
 use pyo3::prelude::*;
@@ -11,6 +12,7 @@ use pyo3::prelude::*;
 mod elbo_sdk_rust {
     use crate::asset_sync_context::AssetSyncContext;
     use crate::engine_api;
+    use crate::tbo_export_context::TboExportContext;
     use pivot_com_types::fields::Uuid;
     use pyo3::prelude::*;
     use std::path::PathBuf;
@@ -219,5 +221,11 @@ mod elbo_sdk_rust {
             let _ = engine_api::import_assets_command(paths)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
         });
+    }
+
+    #[pymodule_init]
+    fn pyinit(m: &Bound<'_, PyModule>) -> PyResult<()> {
+        m.add_class::<TboExportContext>()?;
+        Ok(())
     }
 }
