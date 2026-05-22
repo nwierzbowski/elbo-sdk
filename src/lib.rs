@@ -256,4 +256,12 @@ mod elbo_sdk_rust {
         m.add_class::<TboExportContext>()?;
         Ok(())
     }
+
+    #[pyfunction]
+    fn group_all_objects_command(py: Python) -> () {
+        py.detach(|| {
+            let _ = engine_api::group_all_objects_command()
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+        });
+    }
 }

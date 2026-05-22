@@ -326,3 +326,8 @@ pub fn resolve_engine_binary_path() -> Option<PathBuf> {
 
     None
 }
+
+pub fn group_all_objects_command() -> Result<EngineResponse, String> {
+    let command = EngineCommand::group_all_objects();
+    CLIENT.send_command(command)
+}
