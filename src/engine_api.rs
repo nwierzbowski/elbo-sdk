@@ -164,13 +164,6 @@ pub fn organize_objects_command() -> Result<EngineResponse, String> {
     CLIENT.send_command(command)
 }
 
-pub fn extract_geometric_features_command(
-    uuids: Vec<Uuid>,
-) -> Result<EngineResponse, String> {
-    let command = EngineCommand::extract_geometric_features(&uuids, 1);
-    CLIENT.send_command(command)
-}
-
 pub fn get_surface_types_command() -> Result<EngineResponse, String> {
     let command = EngineCommand::get_surface_types(1);
     CLIENT.send_command(command)
@@ -190,16 +183,6 @@ pub fn export_all_command(path: &str, target_bytes: u64) -> Result<EngineRespons
     CLIENT.send_command(command)
 }
 
-pub fn export_mesh_tbo_command(
-    path: &str,
-    target_bytes: u64,
-    flags: u32,
-    uuids: Vec<Uuid>,
-) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_mesh_tbo(path, target_bytes, flags, &uuids);
-    CLIENT.send_command(command)
-}
-
 pub fn export_asset_tbo_command(
     path: &str,
     target_bytes: u64,
@@ -216,16 +199,6 @@ pub fn export_all_asset_tbo_command(path: &str, target_bytes: u64) -> Result<Eng
 
 pub fn drop_all_groups_command() -> Result<EngineResponse, String> {
     let command = EngineCommand::drop_all_groups();
-    CLIENT.send_command(command)
-}
-
-pub fn export_all_tbo_command(
-    path: &str,
-    target_bytes: u64,
-    flags: u32,
-    target_point_count: u32,
-) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_all_tbo(path, target_bytes, flags, target_point_count);
     CLIENT.send_command(command)
 }
 

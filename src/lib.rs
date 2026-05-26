@@ -81,14 +81,6 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn extract_geometric_features_command(py: Python, uuids: Vec<Uuid>) -> () {
-        py.detach(|| {
-            let _ = engine_api::extract_geometric_features_command(uuids)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
-        });
-    }
-
-    #[pyfunction]
     fn get_platform_id() -> PyResult<String> {
         Ok(crate::engine_api::get_platform_id())
     }
@@ -180,20 +172,6 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn export_mesh_tbo_command(
-        py: Python,
-        path: String,
-        target_bytes: u64,
-        flags: u32,
-        uuids: Vec<Uuid>,
-    ) -> () {
-        py.detach(|| {
-            let _ = engine_api::export_mesh_tbo_command(&path, target_bytes, flags, uuids)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
-        });
-    }
-
-    #[pyfunction]
     fn export_asset_tbo_command(
         py: Python,
         path: String,
@@ -225,20 +203,6 @@ mod elbo_sdk_rust {
     fn drop_all_groups_command(py: Python) -> () {
         py.detach(|| {
             let _ = engine_api::drop_all_groups_command()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
-        });
-    }
-
-    #[pyfunction]
-    fn export_all_tbo_command(
-        py: Python,
-        path: String,
-        target_bytes: u64,
-        flags: u32,
-        target_point_count: u32,
-    ) -> () {
-        py.detach(|| {
-            let _ = engine_api::export_all_tbo_command(&path, target_bytes, flags, target_point_count)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
         });
     }
