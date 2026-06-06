@@ -132,33 +132,52 @@ impl TboExportContext {
             _ => TboExportMode::Points,
         };
 
-        // Compute flush threshold: how many meshes fill target_bytes
-        let channel_count = popcount(self.channel_mask) as u64;
-        let per_mesh_bytes = (target_point_count as u64) * channel_count * 4;
-        self.flush_threshold = if per_mesh_bytes > 0 {
-            let threshold = target_bytes / per_mesh_bytes;
-            if threshold < 1000 {
-                1000
-            } else {
-                threshold
-            }
+        // Compute flush threshold: how many objects fill target_bytes
+        if matches!(self.export_mode, TboExportMode::Meshes) {
+            // Meshes mode: 272 channels per object (256 embedding + 16 transform) * 4 bytes
+            let per_object_bytes = 272 * 4; // 1088 bytes
+            self.flush_threshold = target_bytes / per_object_bytes;
         } else {
-            100_000
-        };
+            // Points mode: target_point_count * channel_count * 4 bytes per mesh
+            let channel_count = popcount(self.channel_mask) as u64;
+            let per_mesh_bytes = (target_point_count as u64) * channel_count * 4;
+            self.flush_threshold = if per_mesh_bytes > 0 {
+                let threshold = target_bytes / per_mesh_bytes;
+                if threshold < 1000 {
+                    1000
+                } else {
+                    threshold
+                }
+            } else {
+                100_000
+            };
+        }
 
-        eprintln!(
-            "[TBO] Config: target={} GB, channels={}, pts={}, mode={}, flush_threshold={}, batch_size={}",
-            target_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-            channel_count,
-            target_point_count,
-            match &self.export_mode {
-                TboExportMode::Points => "points",
-                TboExportMode::Meshes => "meshes",
-                TboExportMode::Lbo => "lbo",
-            },
-            self.flush_threshold,
-            self.batch_size,
-        );
+        let mode_label = match &self.export_mode {
+            TboExportMode::Points => "points",
+            TboExportMode::Meshes => "meshes",
+            TboExportMode::Lbo => "lbo",
+        };
+        if matches!(self.export_mode, TboExportMode::Meshes) {
+            eprintln!(
+                "[TBO] Config: target={} MB, mode={}, flush_threshold={} objects, batch_size={}",
+                target_bytes as f64 / (1024.0 * 1024.0),
+                mode_label,
+                self.flush_threshold,
+                self.batch_size,
+            );
+        } else {
+            let channel_count = popcount(self.channel_mask) as u64;
+            eprintln!(
+                "[TBO] Config: target={} GB, channels={}, pts={}, mode={}, flush_threshold={}, batch_size={}",
+                target_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                channel_count,
+                target_point_count,
+                mode_label,
+                self.flush_threshold,
+                self.batch_size,
+            );
+        }
 
         // Configure engine with compute params only (for points mode)
         if let TboExportMode::Points = &self.export_mode {
@@ -176,14 +195,23 @@ impl TboExportContext {
     ///
     /// Args:
     ///     uuid_bytes: UUID bytes (32 bytes)
+    ///     object_count: Number of objects in this asset (for meshes mode tracking)
     ///
     /// Returns:
     ///     Number of meshes accumulated in this call (1 if batch flushed, 0 if still pending)
-    fn accumulate(&mut self, uuid_bytes: Vec<u8>) -> PyResult<u32> {
+    fn accumulate(&mut self, uuid_bytes: Vec<u8>, object_count: u32) -> PyResult<u32> {
         if uuid_bytes.len() != Uuid::SIZE {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("UUID must be {} bytes, got {}", Uuid::SIZE, uuid_bytes.len()),
             ));
+        }
+
+        // For meshes/lbo mode, track object count for flush threshold
+        if matches!(self.export_mode, TboExportMode::Meshes | TboExportMode::Lbo) {
+            self.accumulated_count += object_count as u64;
+            self.pending_downsample.push(uuid_bytes.clone());
+            self.pending_drop.push(uuid_bytes);
+            return Ok(0);
         }
 
         self.pending_downsample.push(uuid_bytes.clone());
