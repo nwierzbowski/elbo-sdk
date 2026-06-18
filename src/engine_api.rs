@@ -202,6 +202,11 @@ pub fn drop_all_groups_command() -> Result<EngineResponse, String> {
     CLIENT.send_command(command)
 }
 
+pub fn export_dup_reset_command() -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_dup_reset();
+    CLIENT.send_command(command)
+}
+
 pub fn import_assets_command(paths: Vec<String>) -> Result<EngineResponse, String> {
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let command = EngineCommand::import_assets(&path_refs);
