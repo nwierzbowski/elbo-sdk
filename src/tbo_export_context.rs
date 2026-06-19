@@ -73,8 +73,6 @@ pub struct TboExportContext {
     pending_downsample: Vec<Vec<u8>>,
     pending_drop: Vec<Vec<u8>>,
     export_mode: TboExportMode,
-    exported_count: u64,
-    pushed_count: u64,
 }
 
 #[pymethods]
@@ -94,8 +92,6 @@ impl TboExportContext {
             pending_downsample: Vec::new(),
             pending_drop: Vec::new(),
             export_mode: TboExportMode::Points,
-            exported_count: 0,
-            pushed_count: 0,
         }
     }
 
@@ -125,8 +121,6 @@ impl TboExportContext {
         self.channel_mask = resolve_channel_mask(flags);
         self.batch_size = batch_size;
         self.accumulated_count = 0;
-        self.exported_count = 0;
-        self.pushed_count = 0;
         self.next_batch_number = 0;
         self.pending_downsample.clear();
         self.pending_drop.clear();
@@ -191,14 +185,6 @@ impl TboExportContext {
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
         }
 
-        // Reset dedup state at start of asset TBO export
-        if let TboExportMode::Meshes = &self.export_mode {
-            engine_api::export_dup_reset_command()
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                    format!("Failed to reset export dedup state: {}", e),
-                ))?;
-        }
-
         Ok(())
     }
 
@@ -218,11 +204,6 @@ impl TboExportContext {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("UUID must be {} bytes, got {}", Uuid::SIZE, uuid_bytes.len()),
             ));
-        }
-
-        // For meshes mode, track asset count (1 asset per call) for reporting
-        if matches!(self.export_mode, TboExportMode::Meshes) {
-            self.pushed_count += 1;
         }
 
         // For meshes/lbo mode, track object count for flush threshold
@@ -409,8 +390,6 @@ impl TboExportContext {
                                 format!("Failed to read flush response: {}", e),
                             ))?;
                         let result: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-                        // Accumulate actual exported count from engine response
-                        self.exported_count += resp.header.num_items as u64;
                         self.accumulated_count = 0;
                         // Drop all groups from scene graph to clear memory
                         engine_api::drop_all_groups_command()
@@ -466,11 +445,8 @@ impl TboExportContext {
             }
             TboExportMode::Meshes => {
                 eprintln!(
-                    "[TBO] Final flush: {} files, {} assets exported ({} pushed, {} deduped)",
+                    "[TBO] Final flush: {} files",
                     files.len(),
-                    self.exported_count,
-                    self.pushed_count,
-                    self.pushed_count - self.exported_count,
                 );
             }
             TboExportMode::Lbo => {
@@ -493,18 +469,6 @@ impl TboExportContext {
     #[getter]
     fn accumulated_count(&self) -> u64 {
         self.accumulated_count
-    }
-
-    /// Get total number of assets actually exported to TBO files (after dedup).
-    #[getter]
-    fn exported_count(&self) -> u64 {
-        self.exported_count
-    }
-
-    /// Get total number of assets pushed to engine (before dedup).
-    #[getter]
-    fn pushed_count(&self) -> u64 {
-        self.pushed_count
     }
 
     /// Get flush threshold (meshes per flush).

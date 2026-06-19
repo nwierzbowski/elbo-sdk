@@ -207,9 +207,4 @@ mod elbo_sdk_rust {
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
     }
 
-    #[pyfunction]
-    fn export_dup_reset_command(_py: Python) -> () {
-        let _ = engine_api::export_dup_reset_command()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
-    }
-}
+  }
