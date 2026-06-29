@@ -166,8 +166,9 @@ mod elbo_sdk_rust {
     fn export_all_asset_tbo_command(
         path: String,
         target_bytes: u64,
+        skip_normalization: bool,
     ) -> PyResult<Vec<String>> {
-        let resp = engine_api::export_all_asset_tbo_command(&path, target_bytes)
+        let resp = engine_api::export_all_asset_tbo_command(&path, target_bytes, skip_normalization)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
         let filenames = resp.read_tbo_flush()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(

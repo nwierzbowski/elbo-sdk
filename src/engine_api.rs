@@ -192,8 +192,8 @@ pub fn export_asset_tbo_command(
     CLIENT.send_command(command)
 }
 
-pub fn export_all_asset_tbo_command(path: &str, target_bytes: u64) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_all_asset_tbo(path, target_bytes);
+pub fn export_all_asset_tbo_command(path: &str, target_bytes: u64, skip_normalization: bool) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_all_asset_tbo(path, target_bytes, skip_normalization);
     CLIENT.send_command(command)
 }
 

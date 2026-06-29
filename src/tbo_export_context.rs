@@ -73,6 +73,7 @@ pub struct TboExportContext {
     pending_downsample: Vec<Vec<u8>>,
     pending_drop: Vec<Vec<u8>>,
     export_mode: TboExportMode,
+    skip_normalization: bool,
 }
 
 #[pymethods]
@@ -92,6 +93,7 @@ impl TboExportContext {
             pending_downsample: Vec::new(),
             pending_drop: Vec::new(),
             export_mode: TboExportMode::Points,
+            skip_normalization: false,
         }
     }
 
@@ -104,7 +106,8 @@ impl TboExportContext {
     ///     target_point_count: Points per mesh after downsampling (default 1024)
     ///     batch_size: Number of UUIDs per downsample+drop batch
     ///     export_mode: Export mode - "points" for mesh TBO, "meshes" for asset TBO
-    #[pyo3(text_signature = "(self, output_dir, target_bytes, flags, target_point_count, batch_size, export_mode)")]
+    ///     skip_normalization: Skip per-asset centering and unit scaling in transforms
+    #[pyo3(text_signature = "(self, output_dir, target_bytes, flags, target_point_count, batch_size, export_mode, skip_normalization)")]
     fn init(
         &mut self,
         output_dir: String,
@@ -113,6 +116,7 @@ impl TboExportContext {
         target_point_count: u32,
         batch_size: usize,
         export_mode: Option<String>,
+        skip_normalization: bool,
     ) -> PyResult<()> {
         self.output_dir = output_dir;
         self.target_bytes = target_bytes;
@@ -120,6 +124,7 @@ impl TboExportContext {
         self.target_point_count = target_point_count;
         self.channel_mask = resolve_channel_mask(flags);
         self.batch_size = batch_size;
+        self.skip_normalization = skip_normalization;
         self.accumulated_count = 0;
         self.next_batch_number = 0;
         self.pending_downsample.clear();
@@ -383,7 +388,7 @@ impl TboExportContext {
                 }
             }
             TboExportMode::Meshes => {
-                match engine_api::export_all_asset_tbo_command(&self.output_dir, self.target_bytes) {
+                match engine_api::export_all_asset_tbo_command(&self.output_dir, self.target_bytes, self.skip_normalization) {
                     Ok(resp) => {
                         let filenames = resp.read_tbo_flush()
                             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
