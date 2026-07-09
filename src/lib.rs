@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 mod elbo_sdk_rust {
     use crate::asset_sync_context::AssetSyncContext;
     use crate::engine_api;
-    use crate::tbo_export_context::TboExportContext;
+    use crate::tbo_export_context::{ExportFormat, TboExportContext};
     use pivot_com_types::fields::Uuid;
     use pyo3::prelude::*;
     use std::path::PathBuf;
@@ -102,8 +102,8 @@ mod elbo_sdk_rust {
         group_names: Vec<String>,
         surface_contexts: Vec<u16>,
         asset_uuids: Vec<Uuid>,
-    ) -> PyResult<AssetSyncContext> {
-        let context = engine_api::allocate_memory(
+    ) -> PyResult<(AssetSyncContext, u64)> {
+        let (context, allocated_bytes) = engine_api::allocate_memory(
             vert_counts,
             edge_counts,
             loop_counts,
@@ -115,7 +115,7 @@ mod elbo_sdk_rust {
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
 
-        Ok(context)
+        Ok((context, allocated_bytes))
     }
 
     #[pyfunction]
@@ -138,16 +138,15 @@ mod elbo_sdk_rust {
     fn export_assets_command(
         _py: Python,
         path: String,
-        target_bytes: u64,
         uuids: Vec<Uuid>,
     ) -> () {
-        let _ = engine_api::export_assets_command(&path, target_bytes, uuids)
+        let _ = engine_api::export_assets_command(&path, uuids)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
     }
 
     #[pyfunction]
-    fn export_all_command(_py: Python, path: String, target_bytes: u64) -> () {
-        let _ = engine_api::export_all_command(&path, target_bytes)
+    fn export_all_command(_py: Python, path: String) -> () {
+        let _ = engine_api::export_all_command(&path)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
     }
 
@@ -155,20 +154,18 @@ mod elbo_sdk_rust {
     fn export_asset_tbo_command(
         _py: Python,
         path: String,
-        target_bytes: u64,
         uuids: Vec<Uuid>,
     ) -> () {
-        let _ = engine_api::export_asset_tbo_command(&path, target_bytes, uuids)
+        let _ = engine_api::export_asset_tbo_command(&path, uuids)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
     }
 
     #[pyfunction]
     fn export_all_asset_tbo_command(
         path: String,
-        target_bytes: u64,
         skip_normalization: bool,
     ) -> PyResult<Vec<String>> {
-        let resp = engine_api::export_all_asset_tbo_command(&path, target_bytes, skip_normalization)
+        let resp = engine_api::export_all_asset_tbo_command(&path, skip_normalization)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
         let filenames = resp.read_tbo_flush()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
@@ -193,6 +190,7 @@ mod elbo_sdk_rust {
     #[pymodule_init]
     fn pyinit(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<TboExportContext>()?;
+        m.add_class::<ExportFormat>()?;
         Ok(())
     }
 

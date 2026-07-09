@@ -1,11 +1,13 @@
-//! TBO Export Context - SDK-side orchestrator for streaming TBO export.
+//! TBO Export Context - SDK-side orchestrator for multi-format streaming export.
 //!
-//! Manages export configuration, tracks accumulated mesh count,
-//! and orchestrates the push → downsample → drop → flush cycle.
+//! Manages export configuration for multiple formats (LBO, TBO-Points, TBO-Fragments),
+//! tracks accumulated memory usage, and orchestrates the push → downsample → drop → flush cycle.
 //!
-//! Batches downsample and drop calls for efficiency.
+//! Flushing is driven by engine memory threshold (max_memory_mb), not per-format target sizes.
+//! Each flush writes all selected formats to disk in a single pass.
 
 use pyo3::prelude::*;
+use std::collections::HashMap;
 
 use pivot_com_types::fields::Uuid;
 
@@ -43,36 +45,41 @@ fn resolve_channel_mask(flags: u32) -> u32 {
     }
 }
 
-/// Export mode for TBO export.
+/// Export format configuration.
 #[pyclass]
 #[derive(Clone)]
-pub enum TboExportMode {
-    /// Point-based export (mesh TBO) - uses downsample + flush pipeline
-    Points,
-    /// Mesh-based export (asset TBO) - uses export_all_asset_tbo
-    Meshes,
-    /// LBO export - uses export_all + drop_all (no downsampling)
-    Lbo,
+pub struct ExportFormat {
+    /// Format name: "lbo", "points", or "meshes"
+    #[pyo3(get)]
+    pub format: String,
 }
 
-/// SDK-side orchestrator for streaming TBO export.
+#[pymethods]
+impl ExportFormat {
+    #[new]
+    fn new(format: String) -> Self {
+        Self { format }
+    }
+}
+
+/// SDK-side orchestrator for streaming multi-format export.
 ///
-/// Holds export configuration, tracks accumulated count, and knows
-/// when to trigger flush based on target file size.
+/// Holds export configuration for multiple formats, tracks accumulated memory usage,
+/// and knows when to trigger flush based on max_memory_mb threshold.
 #[pyclass(unsendable)]
 pub struct TboExportContext {
     output_dir: String,
-    target_bytes: u64,
-    flags: u32,
-    target_point_count: u32,
-    channel_mask: u32,
+    formats: Vec<ExportFormat>,
+    max_memory_mb: f64,
+    accumulated_bytes: u64,
     accumulated_count: u64,
     flush_threshold: u64,
     next_batch_number: u32,
     batch_size: usize,
+    channel_mask: u32,
+    target_point_count: u32,
     pending_downsample: Vec<Vec<u8>>,
     pending_drop: Vec<Vec<u8>>,
-    export_mode: TboExportMode,
     skip_normalization: bool,
 }
 
@@ -82,149 +89,101 @@ impl TboExportContext {
     fn new() -> Self {
         Self {
             output_dir: String::new(),
-            target_bytes: 0,
-            flags: 0,
-            target_point_count: 1024,
-            channel_mask: 0,
+            formats: Vec::new(),
+            max_memory_mb: 16384.0,
+            accumulated_bytes: 0,
             accumulated_count: 0,
             flush_threshold: 0,
             next_batch_number: 0,
             batch_size: 900,
+            channel_mask: 0,
+            target_point_count: 1024,
             pending_downsample: Vec::new(),
             pending_drop: Vec::new(),
-            export_mode: TboExportMode::Points,
             skip_normalization: false,
         }
     }
 
-    /// Initialize the export context and configure the engine.
+    /// Initialize the export context for multi-format export.
     ///
     /// Args:
-    ///     output_dir: Directory to write .tbo files
-    ///     target_bytes: Target size per .tbo file (e.g. 4GB = 4 * 1024^3)
-    ///     flags: Channel mask flags (0x1 = all channels, or bit mask)
-    ///     target_point_count: Points per mesh after downsampling (default 1024)
-    ///     batch_size: Number of UUIDs per downsample+drop batch
-    ///     export_mode: Export mode - "points" for mesh TBO, "meshes" for asset TBO
+    ///     output_dir: Base directory for output files
+    ///     formats: List of ExportFormat objects (e.g., [ExportFormat("lbo"), ExportFormat("points")])
+    ///     max_memory_mb: Engine memory threshold for flush in MB (default 16384 = 16 GB)
     ///     skip_normalization: Skip per-asset centering and unit scaling in transforms
-    #[pyo3(text_signature = "(self, output_dir, target_bytes, flags, target_point_count, batch_size, export_mode, skip_normalization)")]
+    #[pyo3(text_signature = "(self, output_dir, formats, max_memory_mb, skip_normalization)")]
     fn init(
         &mut self,
         output_dir: String,
-        target_bytes: u64,
-        flags: u32,
-        target_point_count: u32,
-        batch_size: usize,
-        export_mode: Option<String>,
+        formats: Vec<ExportFormat>,
+        max_memory_mb: f64,
         skip_normalization: bool,
     ) -> PyResult<()> {
         self.output_dir = output_dir;
-        self.target_bytes = target_bytes;
-        self.flags = flags;
-        self.target_point_count = target_point_count;
-        self.channel_mask = resolve_channel_mask(flags);
-        self.batch_size = batch_size;
+        self.max_memory_mb = max_memory_mb;
         self.skip_normalization = skip_normalization;
+        self.formats = formats;
+        self.accumulated_bytes = 0;
         self.accumulated_count = 0;
         self.next_batch_number = 0;
         self.pending_downsample.clear();
         self.pending_drop.clear();
 
-        // Set export mode
-        self.export_mode = match export_mode.as_deref() {
-            Some("meshes") => TboExportMode::Meshes,
-            Some("lbo") => TboExportMode::Lbo,
-            _ => TboExportMode::Points,
-        };
+        // Compute flush threshold from max_memory_mb (in bytes)
+        self.flush_threshold = (self.max_memory_mb * 1024.0 * 1024.0) as u64;
 
-        // Compute flush threshold: how many objects fill target_bytes
-        if matches!(self.export_mode, TboExportMode::Meshes) {
-            // Meshes mode: 272 channels per object (256 embedding + 16 transform) * 4 bytes
-            let per_object_bytes = 272 * 4; // 1088 bytes
-            self.flush_threshold = target_bytes / per_object_bytes;
-        } else {
-            // Points mode: target_point_count * channel_count * 4 bytes per mesh
-            let channel_count = popcount(self.channel_mask) as u64;
-            let per_mesh_bytes = (target_point_count as u64) * channel_count * 4;
-            self.flush_threshold = if per_mesh_bytes > 0 {
-                let threshold = target_bytes / per_mesh_bytes;
-                if threshold < 1000 {
-                    1000
-                } else {
-                    threshold
-                }
-            } else {
-                100_000
-            };
-        }
-
-        let mode_label = match &self.export_mode {
-            TboExportMode::Points => "points",
-            TboExportMode::Meshes => "meshes",
-            TboExportMode::Lbo => "lbo",
-        };
-        if matches!(self.export_mode, TboExportMode::Meshes) {
-            eprintln!(
-                "[TBO] Config: target={} MB, mode={}, flush_threshold={} objects, batch_size={}",
-                target_bytes as f64 / (1024.0 * 1024.0),
-                mode_label,
-                self.flush_threshold,
-                self.batch_size,
-            );
-        } else {
-            let channel_count = popcount(self.channel_mask) as u64;
-            eprintln!(
-                "[TBO] Config: target={} GB, channels={}, pts={}, mode={}, flush_threshold={}, batch_size={}",
-                target_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
-                channel_count,
-                target_point_count,
-                mode_label,
-                self.flush_threshold,
-                self.batch_size,
-            );
-        }
-
-        // Configure engine with compute params only (for points mode)
-        if let TboExportMode::Points = &self.export_mode {
+        // Extract channel_mask and target_point_count if Points mode is selected
+        let has_points = self.formats.iter().any(|f| f.format == "points");
+        if has_points {
+            self.channel_mask = DEFAULT_CHANNEL_MASK;
+            self.target_point_count = 1024;
             engine_api::tbo_config_command(self.channel_mask, self.target_point_count)
                 .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
         }
 
+        // Log configuration
+        let format_names: Vec<&str> = self.formats.iter().map(|f| f.format.as_str()).collect();
+        eprintln!(
+            "[TBO] Config: formats={:?}, max_memory={} MB, flush_threshold={:.0} MB, skip_normalization={}",
+            format_names,
+            self.max_memory_mb,
+            self.flush_threshold as f64 / (1024.0 * 1024.0),
+            self.skip_normalization,
+        );
+
         Ok(())
     }
 
-    /// Add a mesh UUID to the pending batch.
-    ///
-    /// When the batch reaches batch_size, automatically flushes
-    /// downsample and drop calls to the engine.
+    /// Add a mesh UUID to the pending batch with size tracking.
     ///
     /// Args:
     ///     uuid_bytes: UUID bytes (32 bytes)
     ///     object_count: Number of objects in this asset (for meshes mode tracking)
+    ///     size_bytes: Size in bytes of shared memory allocated for this push
     ///
     /// Returns:
     ///     Number of meshes accumulated in this call (1 if batch flushed, 0 if still pending)
-    fn accumulate(&mut self, uuid_bytes: Vec<u8>, object_count: u32) -> PyResult<u32> {
+    fn accumulate(&mut self, uuid_bytes: Vec<u8>, object_count: u32, size_bytes: u64) -> PyResult<u32> {
         if uuid_bytes.len() != Uuid::SIZE {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("UUID must be {} bytes, got {}", Uuid::SIZE, uuid_bytes.len()),
             ));
         }
 
-        // For meshes/lbo mode, track object count for flush threshold
-        if matches!(self.export_mode, TboExportMode::Meshes | TboExportMode::Lbo) {
-            self.accumulated_count += object_count as u64;
+        // Track bytes for memory-based flush
+        self.accumulated_bytes += size_bytes;
+        // Track count for logging
+        self.accumulated_count += object_count as u64;
+
+        // For points mode, track for downsample/drop batching
+        if self.formats.iter().any(|f| f.format == "points") {
             self.pending_downsample.push(uuid_bytes.clone());
             self.pending_drop.push(uuid_bytes);
-            return Ok(0);
-        }
 
-        self.pending_downsample.push(uuid_bytes.clone());
-        self.pending_drop.push(uuid_bytes);
-
-        // Check if batch is full - downsample immediately to avoid buffer overflow
-        if self.pending_downsample.len() >= self.batch_size {
-            return self.flush_pending();
+            // Check if batch is full - downsample immediately to avoid buffer overflow
+            if self.pending_downsample.len() >= self.batch_size {
+                return self.flush_pending();
+            }
         }
 
         Ok(0)
@@ -233,13 +192,6 @@ impl TboExportContext {
     /// Flush pending downsample and drop calls to the engine.
     fn flush_pending(&mut self) -> PyResult<u32> {
         if self.pending_downsample.is_empty() {
-            return Ok(0);
-        }
-
-        // For meshes/lbo mode, skip downsample/drop (export does its own)
-        if matches!(&self.export_mode, TboExportMode::Meshes | TboExportMode::Lbo) {
-            self.pending_downsample.clear();
-            self.pending_drop.clear();
             return Ok(0);
         }
 
@@ -269,7 +221,7 @@ impl TboExportContext {
                     .iter()
                     .map(|bytes| {
                         let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
-               uuid.bytes.copy_from_slice(&bytes);
+                        uuid.bytes.copy_from_slice(&bytes);
                         Ok(uuid)
                     })
                     .collect();
@@ -294,11 +246,6 @@ impl TboExportContext {
     /// Returns:
     ///     Number of meshes successfully accumulated
     fn downsample(&mut self, uuids: Vec<Vec<u8>>) -> PyResult<u32> {
-        // For meshes/lbo mode, skip downsample (export does its own)
-        if matches!(&self.export_mode, TboExportMode::Meshes | TboExportMode::Lbo) {
-            return Ok(uuids.len() as u32);
-        }
-
         let pivot_uuids: Result<Vec<Uuid>, PyErr> = uuids
             .into_iter()
             .map(|bytes| {
@@ -333,11 +280,6 @@ impl TboExportContext {
     /// Args:
     ///     uuids: List of UUID byte arrays (each 32 bytes)
     fn drop(&self, uuids: Vec<Vec<u8>>) -> PyResult<()> {
-        // For meshes/lbo mode, skip drop (export does its own)
-        if matches!(&self.export_mode, TboExportMode::Meshes | TboExportMode::Lbo) {
-            return Ok(());
-        }
-
         let pivot_uuids: Result<Vec<Uuid>, PyErr> = uuids
             .into_iter()
             .map(|bytes| {
@@ -355,76 +297,81 @@ impl TboExportContext {
         Ok(())
     }
 
-    /// Flush accumulated downsampled data to .tbo files on disk.
+    /// Flush all formats to disk.
+    ///
+    /// Writes all selected formats in a single pass, then drops all groups from the scene graph.
     ///
     /// Returns:
-    ///     List of written .tbo filenames
-    fn flush(&mut self) -> PyResult<Vec<String>> {
-        match &self.export_mode {
-            TboExportMode::Points => {
-                self.flush_pending()?;
-                let batch_offset = self.next_batch_number;
-                match engine_api::tbo_flush_command(&self.output_dir, self.target_bytes, batch_offset) {
-                    Ok(resp) => {
-                        let filenames = resp.read_tbo_flush()
-                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                format!("Failed to read flush response: {}", e),
-                            ))?;
-                        let result: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-                        // Update batch offset for next flush
-                        self.next_batch_number += result.len() as u32;
-                        // Reset accumulated count so needs_flush works correctly for next batch
-                        self.accumulated_count = 0;
-                        // Drop all groups from scene graph to clear memory
-                        engine_api::drop_all_groups_command()
-                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                format!("drop_all_groups failed: {}", e),
-                            ))?;
-                        Ok(result)
-                    }
-                    Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        format!("tbo_flush failed: {}", e),
-                    )),
+    ///     List of (format_name, [filenames]) tuples
+    fn flush(&mut self) -> PyResult<Vec<(String, Vec<String>)>> {
+        let mut result: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Flush Points mode: downsample pending + flush to disk
+        if self.formats.iter().any(|f| f.format == "points") {
+            self.flush_pending()?;
+            let batch_offset = self.next_batch_number;
+            let points_dir = format!("{}/tbo_points", self.output_dir);
+            eprintln!("[TBO] Flushing points to: {}", points_dir);
+            match engine_api::tbo_flush_command(&points_dir, batch_offset) {
+                Ok(resp) => {
+                    let filenames = resp.read_tbo_flush()
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("Failed to read flush response: {}", e),
+                        ))?;
+                    let result_vec: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
+                    let count = result_vec.len();
+                    result.insert("points".to_string(), result_vec);
+                    self.next_batch_number += count as u32;
                 }
-            }
-            TboExportMode::Meshes => {
-                match engine_api::export_all_asset_tbo_command(&self.output_dir, self.target_bytes, self.skip_normalization) {
-                    Ok(resp) => {
-                        let filenames = resp.read_tbo_flush()
-                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                format!("Failed to read flush response: {}", e),
-                            ))?;
-                        let result: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-                        self.accumulated_count = 0;
-                        // Drop all groups from scene graph to clear memory
-                        engine_api::drop_all_groups_command()
-                            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                                format!("drop_all_groups failed: {}", e),
-                            ))?;
-                        Ok(result)
-                    }
-                    Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        format!("export_all_asset_tbo failed: {}", e),
-                    )),
-                }
-            }
-            TboExportMode::Lbo => {
-                // Export all assets to LBO format
-                engine_api::export_all_command(&self.output_dir, self.target_bytes)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        format!("export_all failed: {}", e),
-                    ))?;
-                
-                // Drop all groups from scene graph
-                engine_api::drop_all_groups_command()
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        format!("drop_all_groups failed: {}", e),
-                    ))?;
-                
-                self.accumulated_count = 0;
-                Ok(vec![])
+                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("tbo_flush failed: {}", e),
+                )),
             }
         }
+
+        // Flush Meshes mode (TBO-Fragments)
+        if self.formats.iter().any(|f| f.format == "meshes") {
+            let meshes_dir = format!("{}/tbo_fragments", self.output_dir);
+            eprintln!("[TBO] Flushing meshes to: {}", meshes_dir);
+            match engine_api::export_all_asset_tbo_command(&meshes_dir, self.skip_normalization) {
+                Ok(resp) => {
+                    let filenames = resp.read_tbo_flush()
+                        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                            format!("Failed to read flush response: {}", e),
+                        ))?;
+                    let result_vec: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
+                    result.insert("meshes".to_string(), result_vec);
+                }
+                Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("export_all_asset_tbo failed: {}", e),
+                )),
+            }
+        }
+
+        // Flush LBO mode
+        if self.formats.iter().any(|f| f.format == "lbo") {
+            let lbo_dir = format!("{}/lbo", self.output_dir);
+            eprintln!("[TBO] Flushing lbo to: {}", lbo_dir);
+            engine_api::export_all_command(&lbo_dir)
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    format!("export_all failed: {}", e),
+                ))?;
+            result.insert("lbo".to_string(), vec![]);
+        }
+
+        // Drop all groups once (after all formats flushed)
+        engine_api::drop_all_groups_command()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("drop_all_groups failed: {}", e),
+            ))?;
+
+        // Reset counters
+        self.accumulated_bytes = 0;
+        self.accumulated_count = 0;
+
+        // Convert HashMap to Vec for Python
+        let result_vec: Vec<(String, Vec<String>)> = result.into_iter().collect();
+        Ok(result_vec)
     }
 
     /// Finalize: flush any remaining data and return accumulated count.
@@ -438,53 +385,21 @@ impl TboExportContext {
         }
 
         // Flush to disk
-        let files = self.flush()?;
-        
-        match &self.export_mode {
-            TboExportMode::Points => {
-                eprintln!(
-                    "[TBO] Final flush: {} files, total meshes: {}",
-                    files.len(),
-                    self.accumulated_count,
-                );
-            }
-            TboExportMode::Meshes => {
-                eprintln!(
-                    "[TBO] Final flush: {} files",
-                    files.len(),
-                );
-            }
-            TboExportMode::Lbo => {
-                eprintln!(
-                    "[LBO] Final flush: exported all assets"
-                );
-            }
-        }
-        
+        self.flush()?;
+
+        let format_names: Vec<&str> = self.formats.iter().map(|f| f.format.as_str()).collect();
+        eprintln!(
+            "[TBO] Finalize: {} formats, total meshes: {}",
+            format_names.len(),
+            self.accumulated_count,
+        );
+
         Ok(self.accumulated_count)
     }
 
     /// Check if accumulated data exceeds flush threshold.
     #[getter]
     fn needs_flush(&self) -> bool {
-        self.accumulated_count >= self.flush_threshold
-    }
-
-    /// Get current accumulated mesh count.
-    #[getter]
-    fn accumulated_count(&self) -> u64 {
-        self.accumulated_count
-    }
-
-    /// Get flush threshold (meshes per flush).
-    #[getter]
-    fn flush_threshold(&self) -> u64 {
-        self.flush_threshold
-    }
-
-    /// Get number of pending UUIDs waiting to be flushed.
-    #[getter]
-    fn pending_count(&self) -> usize {
-        self.pending_downsample.len()
+        self.accumulated_bytes >= self.flush_threshold
     }
 }

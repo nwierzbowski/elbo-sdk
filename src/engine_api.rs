@@ -58,7 +58,8 @@ pub fn poll_mesh_sync() -> Result<Option<AssetSyncContext>, String> {
     Ok(Some(AssetSyncContext::new(ptrs, asset_ptrs)))
 }
 
-/// Requests memory for the provided asset metadata and writes the group names and asset metas into the correct places
+/// Requests memory for the provided asset metadata and writes the group names and asset metas into the correct places.
+/// Returns (AssetSyncContext, total_allocated_bytes).
 pub fn allocate_memory(
     vert_counts: Vec<u32>,
     edge_counts: Vec<u32>,
@@ -68,7 +69,7 @@ pub fn allocate_memory(
     group_names: Vec<String>,
     surface_contexts: Vec<u16>,
     asset_uuids: Vec<Uuid>,
-) -> Result<AssetSyncContext, String> {
+) -> Result<(AssetSyncContext, u64), String> {
     let count = asset_uuids.len();
 
     let mut sizes = Vec::with_capacity(count);
@@ -91,6 +92,8 @@ pub fn allocate_memory(
         sizes.push(total_size);
     }
 
+    let total_bytes: u64 = sizes.iter().map(|&s| s as u64).sum();
+
     let command = EngineCommand::alloc_request(&asset_uuids, &sizes);
     let resp = CLIENT.send_command(command)?;
 
@@ -110,7 +113,7 @@ pub fn allocate_memory(
             std::ptr::copy_nonoverlapping(group_name.as_ptr(), name_dest, group_name.len());
         };
     }
-    Ok(AssetSyncContext::new(ptrs, asset_ptrs))
+    Ok((AssetSyncContext::new(ptrs, asset_ptrs), total_bytes))
 }
 
 pub fn send_mesh_command(meta_vec: Vec<AssetPtr>) -> Result<EngineResponse, String> {
@@ -171,29 +174,27 @@ pub fn get_surface_types_command() -> Result<EngineResponse, String> {
 
 pub fn export_assets_command(
     path: &str,
-    target_bytes: u64,
     uuids: Vec<Uuid>,
 ) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_assets(path, target_bytes, &uuids);
+    let command = EngineCommand::export_assets(path, &uuids);
     CLIENT.send_command(command)
 }
 
-pub fn export_all_command(path: &str, target_bytes: u64) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_all(path, target_bytes);
+pub fn export_all_command(path: &str) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_all(path);
     CLIENT.send_command(command)
 }
 
 pub fn export_asset_tbo_command(
     path: &str,
-    target_bytes: u64,
     uuids: Vec<Uuid>,
 ) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_asset_tbo(path, target_bytes, &uuids);
+    let command = EngineCommand::export_asset_tbo(path, &uuids);
     CLIENT.send_command(command)
 }
 
-pub fn export_all_asset_tbo_command(path: &str, target_bytes: u64, skip_normalization: bool) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_all_asset_tbo(path, target_bytes, skip_normalization);
+pub fn export_all_asset_tbo_command(path: &str, skip_normalization: bool) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_all_asset_tbo(path, skip_normalization);
     CLIENT.send_command(command)
 }
 
@@ -218,8 +219,8 @@ pub fn tbo_downsample_command(uuids: Vec<Uuid>) -> Result<EngineResponse, String
     CLIENT.send_command(command)
 }
 
-pub fn tbo_flush_command(path: &str, target_bytes: u64, batch_offset: u32) -> Result<EngineResponse, String> {
-    let command = EngineCommand::tbo_flush(path, target_bytes, batch_offset);
+pub fn tbo_flush_command(path: &str, batch_offset: u32) -> Result<EngineResponse, String> {
+    let command = EngineCommand::tbo_flush(path, batch_offset);
     CLIENT.send_command(command)
 }
 
