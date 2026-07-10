@@ -23,28 +23,6 @@ const CHANNEL_COMBINED: u32 = 1 << 5;
 const DEFAULT_CHANNEL_MASK: u32 = CHANNEL_X | CHANNEL_Y | CHANNEL_Z
     | CHANNEL_NORMAL_VARIANCE | CHANNEL_SURFACE_VARIATION | CHANNEL_COMBINED;
 
-/// Count set bits in a 6-bit channel mask.
-fn popcount(mask: u32) -> u32 {
-    let mut count = 0;
-    for i in 0..6 {
-        if mask & (1 << i) != 0 {
-            count += 1;
-        }
-    }
-    count
-}
-
-/// Resolve channel mask from legacy flags value.
-fn resolve_channel_mask(flags: u32) -> u32 {
-    if flags == 0x1 {
-        DEFAULT_CHANNEL_MASK
-    } else if flags == 0 {
-        CHANNEL_X | CHANNEL_Y | CHANNEL_Z
-    } else {
-        flags
-    }
-}
-
 /// Export format configuration.
 #[pyclass]
 #[derive(Clone)]
@@ -72,7 +50,6 @@ pub struct TboExportContext {
     formats: Vec<ExportFormat>,
     max_memory_mb: f64,
     accumulated_bytes: u64,
-    accumulated_count: u64,
     flush_threshold: u64,
     next_batch_number: u32,
     batch_size: usize,
@@ -92,7 +69,6 @@ impl TboExportContext {
             formats: Vec::new(),
             max_memory_mb: 16384.0,
             accumulated_bytes: 0,
-            accumulated_count: 0,
             flush_threshold: 0,
             next_batch_number: 0,
             batch_size: 900,
@@ -124,7 +100,6 @@ impl TboExportContext {
         self.skip_normalization = skip_normalization;
         self.formats = formats;
         self.accumulated_bytes = 0;
-        self.accumulated_count = 0;
         self.next_batch_number = 0;
         self.pending_downsample.clear();
         self.pending_drop.clear();
@@ -156,14 +131,17 @@ impl TboExportContext {
 
     /// Add a mesh UUID to the pending batch with size tracking.
     ///
+    /// Triggers an automatic flush to disk when either:
+    /// - The points batch size is reached (to avoid buffer overflow)
+    /// - The memory threshold is exceeded (to free shared memory)
+    ///
     /// Args:
     ///     uuid_bytes: UUID bytes (32 bytes)
-    ///     object_count: Number of objects in this asset (for meshes mode tracking)
     ///     size_bytes: Size in bytes of shared memory allocated for this push
     ///
     /// Returns:
-    ///     Number of meshes accumulated in this call (1 if batch flushed, 0 if still pending)
-    fn accumulate(&mut self, uuid_bytes: Vec<u8>, object_count: u32, size_bytes: u64) -> PyResult<u32> {
+    ///     List of (format_name, [filenames]) tuples if a flush occurred, empty list otherwise
+    fn accumulate(&mut self, uuid_bytes: Vec<u8>, size_bytes: u64) -> PyResult<Vec<(String, Vec<String>)>> {
         if uuid_bytes.len() != Uuid::SIZE {
             return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
                 format!("UUID must be {} bytes, got {}", Uuid::SIZE, uuid_bytes.len()),
@@ -172,129 +150,24 @@ impl TboExportContext {
 
         // Track bytes for memory-based flush
         self.accumulated_bytes += size_bytes;
-        // Track count for logging
-        self.accumulated_count += object_count as u64;
 
         // For points mode, track for downsample/drop batching
         if self.formats.iter().any(|f| f.format == "points") {
             self.pending_downsample.push(uuid_bytes.clone());
             self.pending_drop.push(uuid_bytes);
 
-            // Check if batch is full - downsample immediately to avoid buffer overflow
+            // Check if batch is full - flush immediately to avoid buffer overflow
             if self.pending_downsample.len() >= self.batch_size {
-                return self.flush_pending();
+                return self.flush();
             }
         }
 
-        Ok(0)
-    }
-
-    /// Flush pending downsample and drop calls to the engine.
-    fn flush_pending(&mut self) -> PyResult<u32> {
-        if self.pending_downsample.is_empty() {
-            return Ok(0);
+        // Check if memory threshold exceeded - flush to free shared memory
+        if self.accumulated_bytes >= self.flush_threshold {
+            return self.flush();
         }
 
-        let downsample_uuids = std::mem::take(&mut self.pending_downsample);
-        let drop_uuids = std::mem::take(&mut self.pending_drop);
-
-        // Downsample
-        let pivot_downsample: Result<Vec<Uuid>, PyErr> = downsample_uuids
-            .iter()
-            .map(|bytes| {
-                let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
-                uuid.bytes.copy_from_slice(bytes);
-                Ok(uuid)
-            })
-            .collect();
-
-        let pivot_downsample = pivot_downsample?;
-        let count = pivot_downsample.len();
-
-        match engine_api::tbo_downsample_command(pivot_downsample) {
-            Ok(resp) => {
-                let accumulated = resp.read_tbo_downsample();
-                self.accumulated_count += accumulated as u64;
-
-                // Drop
-                let pivot_drop: Result<Vec<Uuid>, PyErr> = drop_uuids
-                    .iter()
-                    .map(|bytes| {
-                        let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
-                        uuid.bytes.copy_from_slice(&bytes);
-                        Ok(uuid)
-                    })
-                    .collect();
-
-                let pivot_drop = pivot_drop.map_err(|e| e)?;
-                engine_api::drop_groups_command(pivot_drop)
-                    .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-
-                Ok(accumulated)
-            }
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("tbo_downsample failed: {}, requested: {}", e, count),
-            )),
-        }
-    }
-
-    /// Downsample a batch of UUIDs from the engine scene graph and accumulate results.
-    ///
-    /// Args:
-    ///     uuids: List of UUID byte arrays (each 32 bytes)
-    ///
-    /// Returns:
-    ///     Number of meshes successfully accumulated
-    fn downsample(&mut self, uuids: Vec<Vec<u8>>) -> PyResult<u32> {
-        let pivot_uuids: Result<Vec<Uuid>, PyErr> = uuids
-            .into_iter()
-            .map(|bytes| {
-                if bytes.len() != Uuid::SIZE {
-                    return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                        format!("UUID must be {} bytes, got {}", Uuid::SIZE, bytes.len()),
-                    ));
-                }
-                let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
-                uuid.bytes.copy_from_slice(&bytes);
-                Ok(uuid)
-            })
-            .collect();
-
-        let pivot_uuids = pivot_uuids?;
-        let count = pivot_uuids.len();
-
-        match engine_api::tbo_downsample_command(pivot_uuids) {
-            Ok(resp) => {
-                let accumulated = resp.read_tbo_downsample();
-                self.accumulated_count += accumulated as u64;
-                Ok(accumulated)
-            }
-            Err(e) => Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("tbo_downsample failed: {}, requested: {}", e, count),
-            )),
-        }
-    }
-
-    /// Drop a batch of UUIDs from the engine scene graph and memory bank.
-    ///
-    /// Args:
-    ///     uuids: List of UUID byte arrays (each 32 bytes)
-    fn drop(&self, uuids: Vec<Vec<u8>>) -> PyResult<()> {
-        let pivot_uuids: Result<Vec<Uuid>, PyErr> = uuids
-            .into_iter()
-            .map(|bytes| {
-                let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
-                uuid.bytes.copy_from_slice(&bytes);
-                Ok(uuid)
-            })
-            .collect();
-
-        let pivot_uuids = pivot_uuids.map_err(|e| e)?;
-
-        engine_api::drop_groups_command(pivot_uuids)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-
-        Ok(())
+        Ok(vec![])
     }
 
     /// Flush all formats to disk.
@@ -308,7 +181,29 @@ impl TboExportContext {
 
         // Flush Points mode: downsample pending + flush to disk
         if self.formats.iter().any(|f| f.format == "points") {
-            self.flush_pending()?;
+            // Downsample pending
+            if !self.pending_downsample.is_empty() {
+                let downsample_uuids = std::mem::take(&mut self.pending_downsample);
+
+                let pivot_downsample: Result<Vec<Uuid>, PyErr> = downsample_uuids
+                    .iter()
+                    .map(|bytes| {
+                        let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
+                        uuid.bytes.copy_from_slice(bytes);
+                        Ok(uuid)
+                    })
+                    .collect();
+
+                let pivot_downsample = pivot_downsample?;
+
+                match engine_api::tbo_downsample_command(pivot_downsample) {
+                    Ok(_) => {}
+                    Err(e) => return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        format!("tbo_downsample failed: {}", e),
+                    )),
+                }
+            }
+
             let batch_offset = self.next_batch_number;
             let points_dir = format!("{}/tbo_points", self.output_dir);
             eprintln!("[TBO] Flushing points to: {}", points_dir);
@@ -367,39 +262,10 @@ impl TboExportContext {
 
         // Reset counters
         self.accumulated_bytes = 0;
-        self.accumulated_count = 0;
 
         // Convert HashMap to Vec for Python
         let result_vec: Vec<(String, Vec<String>)> = result.into_iter().collect();
         Ok(result_vec)
     }
 
-    /// Finalize: flush any remaining data and return accumulated count.
-    ///
-    /// Returns:
-    ///     Total number of meshes accumulated during this export session
-    fn finalize(&mut self) -> PyResult<u64> {
-        // Flush any pending downsample/drop calls
-        if !self.pending_downsample.is_empty() {
-            self.flush_pending()?;
-        }
-
-        // Flush to disk
-        self.flush()?;
-
-        let format_names: Vec<&str> = self.formats.iter().map(|f| f.format.as_str()).collect();
-        eprintln!(
-            "[TBO] Finalize: {} formats, total meshes: {}",
-            format_names.len(),
-            self.accumulated_count,
-        );
-
-        Ok(self.accumulated_count)
-    }
-
-    /// Check if accumulated data exceeds flush threshold.
-    #[getter]
-    fn needs_flush(&self) -> bool {
-        self.accumulated_bytes >= self.flush_threshold
-    }
 }
