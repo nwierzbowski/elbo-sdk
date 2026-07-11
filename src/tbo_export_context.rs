@@ -1,9 +1,9 @@
 //! TBO Export Context - SDK-side orchestrator for multi-format streaming export.
 //!
 //! Manages export configuration for multiple formats (LBO, TBO-Points, TBO-Fragments),
-//! tracks accumulated memory usage, and orchestrates the push → downsample → drop → flush cycle.
+//! tracks accumulated memory usage, and orchestrates the push → flush → drop cycle.
 //!
-//! Flushing is driven by engine memory threshold (max_memory_mb), not per-format target sizes.
+//! Flushing is driven by engine memory threshold (max_memory_mb) or on close().
 //! Each flush writes all selected formats to disk in a single pass.
 
 use pyo3::prelude::*;
@@ -52,9 +52,6 @@ pub struct TboExportContext {
     accumulated_bytes: u64,
     flush_threshold: u64,
     next_batch_number: u32,
-    batch_size: usize,
-    pending_downsample: Vec<Vec<u8>>,
-    pending_drop: Vec<Vec<u8>>,
     skip_normalization: bool,
     pending_asset_ctx: Option<AssetSyncContext>,
     pending_allocated_bytes: u64,
@@ -79,20 +76,6 @@ impl TboExportContext {
     ) -> PyResult<Self> {
         let flush_threshold = (max_memory_mb * 1024.0 * 1024.0) as u64;
 
-        // Extract channel_mask and target_point_count if Points mode is selected
-        let has_points = formats.iter().any(|f| f.format == "points");
-        let (channel_mask, target_point_count) = if has_points {
-            (DEFAULT_CHANNEL_MASK, 1024u32)
-        } else {
-            (0, 1024u32)
-        };
-
-        // Configure engine (only for points mode)
-        if has_points {
-            engine_api::tbo_config_command(channel_mask, target_point_count)
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        }
-
         // Log configuration
         let format_names: Vec<&str> = formats.iter().map(|f| f.format.as_str()).collect();
         eprintln!(
@@ -109,9 +92,6 @@ impl TboExportContext {
             accumulated_bytes: 0,
             flush_threshold,
             next_batch_number: 0,
-            batch_size: 900,
-            pending_downsample: Vec::new(),
-            pending_drop: Vec::new(),
             skip_normalization,
             pending_asset_ctx: None,
             pending_allocated_bytes: 0,
@@ -187,14 +167,12 @@ impl TboExportContext {
 
     /// Send accumulated mesh and track bytes.
     ///
-    /// Triggers an automatic flush to disk when either:
-    /// - The points batch size is reached (to avoid buffer overflow)
-    /// - The memory threshold is exceeded (to free shared memory)
+    /// Triggers an automatic flush to disk when the memory threshold is exceeded.
     ///
     /// Returns:
     ///     List of (format_name, [filenames]) tuples if a flush occurred, empty list otherwise
     fn accumulate(&mut self) -> PyResult<Vec<(String, Vec<String>)>> {
-        let uuid_bytes = self.pending_uuid.take().ok_or_else(|| {
+        let _uuid_bytes = self.pending_uuid.take().ok_or_else(|| {
             PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("No pending UUID - call prepare_mesh_send first")
         })?;
 
@@ -206,17 +184,6 @@ impl TboExportContext {
         // Track bytes for memory-based flush
         self.accumulated_bytes += self.pending_allocated_bytes;
         self.pending_allocated_bytes = 0;
-
-        // For points mode, track for downsample/drop batching
-        if self.formats.iter().any(|f| f.format == "points") {
-            self.pending_downsample.push(uuid_bytes.clone());
-            self.pending_drop.push(uuid_bytes);
-
-            // Check if batch is full - flush immediately to avoid buffer overflow
-            if self.pending_downsample.len() >= self.batch_size {
-                return self.do_flush().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e));
-            }
-        }
 
         // Check if memory threshold exceeded - flush to free shared memory
         if self.accumulated_bytes >= self.flush_threshold {
@@ -240,31 +207,13 @@ impl TboExportContext {
     fn do_flush(&mut self) -> Result<Vec<(String, Vec<String>)>, String> {
         let mut result: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Flush Points mode: downsample pending + flush to disk
+        // Flush Points mode: single combined operation from scene graph
         if self.formats.iter().any(|f| f.format == "points") {
-            // Downsample pending
-            if !self.pending_downsample.is_empty() {
-                let downsample_uuids = std::mem::take(&mut self.pending_downsample);
-
-                let pivot_downsample: Result<Vec<Uuid>, String> = downsample_uuids
-                    .iter()
-                    .map(|bytes| {
-                        let mut uuid = Uuid { bytes: [0u8; Uuid::SIZE] };
-                        uuid.bytes.copy_from_slice(bytes);
-                        Ok(uuid)
-                    })
-                    .collect();
-
-                let pivot_downsample = pivot_downsample?;
-
-                engine_api::tbo_downsample_command(pivot_downsample)
-                    .map_err(|e| format!("tbo_downsample failed: {}", e))?;
-            }
-
-            let batch_offset = self.next_batch_number;
+            let channel_mask = DEFAULT_CHANNEL_MASK;
+            let target_point_count = 1024u32;
             let points_dir = format!("{}/tbo_points", self.output_dir);
             eprintln!("[TBO] Flushing points to: {}", points_dir);
-            match engine_api::tbo_flush_command(&points_dir, batch_offset) {
+            match engine_api::tbo_points_flush_command(&points_dir, channel_mask, target_point_count) {
                 Ok(resp) => {
                     let filenames = resp.read_tbo_flush()
                         .map_err(|e| format!("Failed to read flush response: {}", e))?;
@@ -273,7 +222,7 @@ impl TboExportContext {
                     result.insert("points".to_string(), result_vec);
                     self.next_batch_number += count as u32;
                 }
-                Err(e) => return Err(format!("tbo_flush failed: {}", e)),
+                Err(e) => return Err(format!("tbo_points_flush failed: {}", e)),
             }
         }
 
