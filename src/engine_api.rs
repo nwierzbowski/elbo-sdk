@@ -214,6 +214,11 @@ pub fn tbo_points_flush_command(path: &str, channel_mask: u32, target_point_coun
     CLIENT.send_command(command)
 }
 
+pub fn export_all_asset_tbo_transforms_command(path: &str, scene_uuid: [u8; 32]) -> Result<EngineResponse, String> {
+    let command = EngineCommand::export_all_asset_tbo_transforms(path, scene_uuid);
+    CLIENT.send_command(command)
+}
+
 pub fn set_engine_dir(path: PathBuf) {
     let mut guard = ENGINE_DIR
         .lock()

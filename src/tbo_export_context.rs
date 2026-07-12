@@ -241,6 +241,22 @@ impl TboExportContext {
             }
         }
 
+        // Flush Transforms mode (TBO-Transforms)
+        if self.formats.iter().any(|f| f.format == "transforms") {
+            let scene_uuid = crate::engine_api::generate_uuid_bytes();
+            let transforms_dir = format!("{}/tbo_transforms", self.output_dir);
+            eprintln!("[TBO] Flushing transforms to: {}", transforms_dir);
+            match engine_api::export_all_asset_tbo_transforms_command(&transforms_dir, scene_uuid) {
+                Ok(resp) => {
+                    let filenames = resp.read_tbo_flush()
+                        .map_err(|e| format!("Failed to read flush response: {}", e))?;
+                    let result_vec: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
+                    result.insert("transforms".to_string(), result_vec);
+                }
+                Err(e) => return Err(format!("export_all_asset_tbo_transforms failed: {}", e)),
+            }
+        }
+
         // Flush LBO mode
         if self.formats.iter().any(|f| f.format == "lbo") {
             let lbo_dir = format!("{}/lbo", self.output_dir);
