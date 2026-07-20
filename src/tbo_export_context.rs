@@ -243,6 +243,13 @@ impl TboExportContext {
 
         // Flush Transforms mode (TBO-Transforms)
         if self.formats.iter().any(|f| f.format == "transforms") {
+            // Compute embeddings for all assets in scene graph before transforms export
+            eprintln!("[TBO] Computing embeddings for transforms export...");
+            match engine_api::embed_all_assets_command() {
+                Ok(_) => eprintln!("[TBO] Embeddings computed successfully"),
+                Err(e) => eprintln!("[TBO] WARNING: embed_all_assets failed: {}", e),
+            }
+
             let scene_uuid = crate::engine_api::generate_uuid_bytes();
             let transforms_dir = format!("{}/tbo_transforms", self.output_dir);
             eprintln!("[TBO] Flushing transforms to: {}", transforms_dir);
