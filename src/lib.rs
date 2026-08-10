@@ -151,31 +151,6 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn export_asset_tbo_command(
-        _py: Python,
-        path: String,
-        uuids: Vec<Uuid>,
-    ) -> () {
-        let _ = engine_api::export_asset_tbo_command(&path, uuids)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
-    }
-
-    #[pyfunction]
-    fn export_all_asset_tbo_command(
-        path: String,
-        skip_normalization: bool,
-    ) -> PyResult<Vec<String>> {
-        let resp = engine_api::export_all_asset_tbo_command(&path, skip_normalization)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        let filenames = resp.read_tbo_flush()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to read flush response: {}", e),
-            ))?;
-        let result: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-        Ok(result)
-    }
-
-    #[pyfunction]
     fn drop_all_groups_command(_py: Python) -> () {
         let _ = engine_api::drop_all_groups_command()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
@@ -201,9 +176,40 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn embed_all_assets_command(_py: Python) -> () {
-        let _ = engine_api::embed_all_assets_command()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn tbo_export_command(
+        path: String,
+        scene_uuid: Vec<u8>,
+        scene_transform: bool,
+        scene_similarity: bool,
+        asset_embedding: bool,
+        asset_transform: bool,
+        fragment_xyz: bool,
+        normal_variance: bool,
+        surface_variation: bool,
+        combined: bool,
+        target_point_count: u32,
+    ) -> PyResult<Vec<String>> {
+        let scene_uuid_arr: [u8; 32] = scene_uuid.try_into()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("scene_uuid must be 32 bytes"))?;
+        let resp = engine_api::tbo_export_command(
+            &path,
+            scene_uuid_arr,
+            scene_transform,
+            scene_similarity,
+            asset_embedding,
+            asset_transform,
+            fragment_xyz,
+            normal_variance,
+            surface_variation,
+            combined,
+            target_point_count,
+        )
+        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        let filenames = resp.read_tbo_flush()
+            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                format!("Failed to read flush response: {}", e),
+            ))?;
+        let result: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
+        Ok(result)
     }
-
-  }
+}

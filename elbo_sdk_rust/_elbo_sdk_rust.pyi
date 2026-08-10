@@ -59,3 +59,36 @@ class AssetSyncContext:
     def buffers(self, i: int) -> Tuple[memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview]: ...
     def size(self) -> int: ...
     def finalize(self) -> None: ...
+
+
+def export_assets_command(path: str, uuids: List[bytes]) -> None: ...
+
+
+def export_all_command(path: str) -> None: ...
+
+
+def drop_all_groups_command() -> None: ...
+
+
+def import_assets_command(paths: List[str]) -> None: ...
+
+
+def standardize_groups_command(uuids: List[bytes]) -> None: ...
+
+
+def group_all_objects_command() -> None: ...
+
+
+def tbo_export_command(
+    path: str,
+    scene_uuid: List[int],
+    scene_transform: bool,
+    scene_similarity: bool,
+    asset_embedding: bool,
+    asset_transform: bool,
+    fragment_xyz: bool,
+    normal_variance: bool,
+    surface_variation: bool,
+    combined: bool,
+    target_point_count: int,
+) -> List[str]: ...

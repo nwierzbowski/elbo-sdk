@@ -1,30 +1,19 @@
-//! TBO Export Context - SDK-side orchestrator for multi-format streaming export.
+//! TBO Export Context - SDK-side orchestrator for streaming export.
 //!
-//! Manages export configuration for multiple formats (LBO, TBO-Points, TBO-Fragments),
-//! tracks accumulated memory usage, and orchestrates the push → flush → drop cycle.
+//! Manages export configuration via channel flags, tracks accumulated memory usage,
+//! and orchestrates the push → flush → drop cycle.
 //!
 //! Flushing is driven by engine memory threshold (max_memory_mb) or on close().
-//! Each flush writes all selected formats to disk in a single pass.
+//! Each flush calls the engine's consolidated tbo_export command.
 
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
 use crate::asset_sync_context::AssetSyncContext;
 use pivot_com_types::fields::Uuid;
 
 use crate::engine_api;
 
-/// Channel bit flags (must match engine constants)
-const CHANNEL_X: u32 = 1 << 0;
-const CHANNEL_Y: u32 = 1 << 1;
-const CHANNEL_Z: u32 = 1 << 2;
-const CHANNEL_NORMAL_VARIANCE: u32 = 1 << 3;
-const CHANNEL_SURFACE_VARIATION: u32 = 1 << 4;
-const CHANNEL_COMBINED: u32 = 1 << 5;
-const DEFAULT_CHANNEL_MASK: u32 = CHANNEL_X | CHANNEL_Y | CHANNEL_Z
-    | CHANNEL_NORMAL_VARIANCE | CHANNEL_SURFACE_VARIATION | CHANNEL_COMBINED;
-
-/// Export format configuration.
+/// Export format configuration (kept for backward compatibility).
 #[pyclass]
 #[derive(Clone)]
 pub struct ExportFormat {
@@ -41,18 +30,25 @@ impl ExportFormat {
     }
 }
 
-/// SDK-side orchestrator for streaming multi-format export.
+/// SDK-side orchestrator for streaming export.
 ///
-/// Holds export configuration for multiple formats, tracks accumulated memory usage,
+/// Holds export configuration via channel flags, tracks accumulated memory usage,
 /// and knows when to trigger flush based on max_memory_mb threshold.
 #[pyclass(unsendable)]
 pub struct TboExportContext {
     output_dir: String,
-    formats: Vec<ExportFormat>,
+    scene_transform: bool,
+    scene_similarity: bool,
+    asset_embedding: bool,
+    asset_transform: bool,
+    fragment_xyz: bool,
+    normal_variance: bool,
+    surface_variation: bool,
+    combined: bool,
     accumulated_bytes: u64,
     flush_threshold: u64,
     next_batch_number: u32,
-    skip_normalization: bool,
+    target_point_count: u32,
     pending_asset_ctx: Option<AssetSyncContext>,
     pending_allocated_bytes: u64,
     pending_uuid: Option<Vec<u8>>,
@@ -60,39 +56,71 @@ pub struct TboExportContext {
 
 #[pymethods]
 impl TboExportContext {
-    /// Create and initialize the export context for multi-format export.
+    /// Create and initialize the export context.
     ///
     /// Args:
     ///     output_dir: Base directory for output files
-    ///     formats: List of ExportFormat objects (e.g., [ExportFormat("lbo"), ExportFormat("points")])
+    ///     scene_transform: Export scene-level 16 transforms
+    ///     scene_similarity: Export scene-level similarity (requires embeddings)
+    ///     asset_embedding: Export 256-d asset embeddings
+    ///     asset_transform: Export 16 asset transforms
+    ///     fragment_xyz: Export XYZ points
+    ///     normal_variance: Export normal variance points
+    ///     surface_variation: Export surface variation points
+    ///     combined: Export combined points
     ///     max_memory_mb: Engine memory threshold for flush in MB (default 16384 = 16 GB)
-    ///     skip_normalization: Skip per-asset centering and unit scaling in transforms
+    ///     target_point_count: Target number of points for downsampling (default 1024)
     #[new]
+    #[pyo3(signature = (
+        output_dir,
+        scene_transform,
+        scene_similarity,
+        asset_embedding,
+        asset_transform,
+        fragment_xyz,
+        normal_variance,
+        surface_variation,
+        combined,
+        max_memory_mb,
+        target_point_count,
+    ))]
     fn new(
         output_dir: String,
-        formats: Vec<ExportFormat>,
+        scene_transform: bool,
+        scene_similarity: bool,
+        asset_embedding: bool,
+        asset_transform: bool,
+        fragment_xyz: bool,
+        normal_variance: bool,
+        surface_variation: bool,
+        combined: bool,
         max_memory_mb: f64,
-        skip_normalization: bool,
+        target_point_count: u32,
     ) -> PyResult<Self> {
         let flush_threshold = (max_memory_mb * 1024.0 * 1024.0) as u64;
 
         // Log configuration
-        let format_names: Vec<&str> = formats.iter().map(|f| f.format.as_str()).collect();
         eprintln!(
-            "[TBO] Config: formats={:?}, max_memory={} MB, flush_threshold={:.0} MB, skip_normalization={}",
-            format_names,
-            max_memory_mb,
-            flush_threshold as f64 / (1024.0 * 1024.0),
-            skip_normalization,
+            "[TBO] Config: scene_transform={}, scene_similarity={}, asset_embedding={}, asset_transform={}, fragment_xyz={}, normal_variance={}, surface_variation={}, combined={}, max_memory={} MB, target_points={}",
+            scene_transform, scene_similarity, asset_embedding, asset_transform,
+            fragment_xyz, normal_variance, surface_variation, combined,
+            max_memory_mb, target_point_count
         );
 
         Ok(Self {
             output_dir,
-            formats,
+            scene_transform,
+            scene_similarity,
+            asset_embedding,
+            asset_transform,
+            fragment_xyz,
+            normal_variance,
+            surface_variation,
+            combined,
             accumulated_bytes: 0,
             flush_threshold,
             next_batch_number: 0,
-            skip_normalization,
+            target_point_count,
             pending_asset_ctx: None,
             pending_allocated_bytes: 0,
             pending_uuid: None,
@@ -201,77 +229,38 @@ impl TboExportContext {
 }
 
 impl TboExportContext {
-    /// Flush all formats to disk and drop all groups.
+    /// Flush all selected channels to disk and drop all groups.
     ///
-    /// Returns filenames written by points and meshes exporters, or empty list for lbo.
+    /// Calls the engine's consolidated tbo_export command which handles
+    /// all channel selection and file writing internally.
+    ///
+    /// Returns filenames written, or empty list if nothing was flushed.
     fn do_flush(&mut self) -> Result<Vec<(String, Vec<String>)>, String> {
-        let mut result: HashMap<String, Vec<String>> = HashMap::new();
-
-        // Flush Points mode: single combined operation from scene graph
-        if self.formats.iter().any(|f| f.format == "points") {
-            let channel_mask = DEFAULT_CHANNEL_MASK;
-            let target_point_count = 1024u32;
-            let points_dir = format!("{}/tbo_points", self.output_dir);
-            eprintln!("[TBO] Flushing points to: {}", points_dir);
-            match engine_api::tbo_points_flush_command(&points_dir, channel_mask, target_point_count) {
-                Ok(resp) => {
-                    let filenames = resp.read_tbo_flush()
-                        .map_err(|e| format!("Failed to read flush response: {}", e))?;
-                    let result_vec: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-                    let count = result_vec.len();
-                    result.insert("points".to_string(), result_vec);
-                    self.next_batch_number += count as u32;
-                }
-                Err(e) => return Err(format!("tbo_points_flush failed: {}", e)),
+        // Call the consolidated TBO export command
+        let scene_uuid = engine_api::generate_uuid_bytes();
+        let filenames = match engine_api::tbo_export_command(
+            &self.output_dir,
+            scene_uuid,
+            self.scene_transform,
+            self.scene_similarity,
+            self.asset_embedding,
+            self.asset_transform,
+            self.fragment_xyz,
+            self.normal_variance,
+            self.surface_variation,
+            self.combined,
+            self.target_point_count,
+        ) {
+            Ok(resp) => {
+                let file_names = resp.read_tbo_flush()
+                    .map_err(|e| format!("Failed to read flush response: {}", e))?;
+                let result_vec: Vec<String> = file_names.into_iter().map(|s| s.to_string()).collect();
+                let count = result_vec.len();
+                self.next_batch_number += count as u32;
+                result_vec
             }
-        }
-
-        // Flush Meshes mode (TBO-Fragments)
-        if self.formats.iter().any(|f| f.format == "meshes") {
-            let meshes_dir = format!("{}/tbo_fragments", self.output_dir);
-            eprintln!("[TBO] Flushing meshes to: {}", meshes_dir);
-            match engine_api::export_all_asset_tbo_command(&meshes_dir, self.skip_normalization) {
-                Ok(resp) => {
-                    let filenames = resp.read_tbo_flush()
-                        .map_err(|e| format!("Failed to read flush response: {}", e))?;
-                    let result_vec: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-                    result.insert("meshes".to_string(), result_vec);
-                }
-                Err(e) => return Err(format!("export_all_asset_tbo failed: {}", e)),
-            }
-        }
-
-        // Flush Transforms mode (TBO-Transforms)
-        if self.formats.iter().any(|f| f.format == "transforms") {
-            // Compute embeddings for all assets in scene graph before transforms export
-            eprintln!("[TBO] Computing embeddings for transforms export...");
-            match engine_api::embed_all_assets_command() {
-                Ok(_) => eprintln!("[TBO] Embeddings computed successfully"),
-                Err(e) => eprintln!("[TBO] WARNING: embed_all_assets failed: {}", e),
-            }
-
-            let scene_uuid = crate::engine_api::generate_uuid_bytes();
-            let transforms_dir = format!("{}/tbo_transforms", self.output_dir);
-            eprintln!("[TBO] Flushing transforms to: {}", transforms_dir);
-            match engine_api::export_all_asset_tbo_transforms_command(&transforms_dir, scene_uuid) {
-                Ok(resp) => {
-                    let filenames = resp.read_tbo_flush()
-                        .map_err(|e| format!("Failed to read flush response: {}", e))?;
-                    let result_vec: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
-                    result.insert("transforms".to_string(), result_vec);
-                }
-                Err(e) => return Err(format!("export_all_asset_tbo_transforms failed: {}", e)),
-            }
-        }
-
-        // Flush LBO mode
-        if self.formats.iter().any(|f| f.format == "lbo") {
-            let lbo_dir = format!("{}/lbo", self.output_dir);
-            eprintln!("[TBO] Flushing lbo to: {}", lbo_dir);
-            engine_api::export_all_command(&lbo_dir)
-                .map_err(|e| format!("export_all failed: {}", e))?;
-            result.insert("lbo".to_string(), vec![]);
-        }
+            Err(e) => return Err(format!("tbo_export failed: {}", e)),
+        };
 
         // Drop all groups once (after all formats flushed)
         engine_api::drop_all_groups_command()
@@ -280,8 +269,10 @@ impl TboExportContext {
         // Reset counters
         self.accumulated_bytes = 0;
 
-        // Convert HashMap to Vec for Python
-        let result_vec: Vec<(String, Vec<String>)> = result.into_iter().collect();
+        // Convert to Vec for Python
+        let result_vec: Vec<(String, Vec<String>)> = filenames.iter()
+            .map(|f| ("tbo".to_string(), vec![f.clone()]))
+            .collect();
         Ok(result_vec)
     }
 }

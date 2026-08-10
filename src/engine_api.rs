@@ -185,19 +185,6 @@ pub fn export_all_command(path: &str) -> Result<EngineResponse, String> {
     CLIENT.send_command(command)
 }
 
-pub fn export_asset_tbo_command(
-    path: &str,
-    uuids: Vec<Uuid>,
-) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_asset_tbo(path, &uuids);
-    CLIENT.send_command(command)
-}
-
-pub fn export_all_asset_tbo_command(path: &str, skip_normalization: bool) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_all_asset_tbo(path, skip_normalization);
-    CLIENT.send_command(command)
-}
-
 pub fn drop_all_groups_command() -> Result<EngineResponse, String> {
     let command = EngineCommand::drop_all_groups();
     CLIENT.send_command(command)
@@ -206,16 +193,6 @@ pub fn drop_all_groups_command() -> Result<EngineResponse, String> {
 pub fn import_assets_command(paths: Vec<String>) -> Result<EngineResponse, String> {
     let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
     let command = EngineCommand::import_assets(&path_refs);
-    CLIENT.send_command(command)
-}
-
-pub fn tbo_points_flush_command(path: &str, channel_mask: u32, target_point_count: u32) -> Result<EngineResponse, String> {
-    let command = EngineCommand::tbo_points_flush(path, channel_mask, target_point_count);
-    CLIENT.send_command(command)
-}
-
-pub fn export_all_asset_tbo_transforms_command(path: &str, scene_uuid: [u8; 32]) -> Result<EngineResponse, String> {
-    let command = EngineCommand::export_all_asset_tbo_transforms(path, scene_uuid);
     CLIENT.send_command(command)
 }
 
@@ -301,7 +278,31 @@ pub fn group_all_objects_command() -> Result<EngineResponse, String> {
     CLIENT.send_command(command)
 }
 
-pub fn embed_all_assets_command() -> Result<EngineResponse, String> {
-    let command = EngineCommand::embed_all_assets(0);
+pub fn tbo_export_command(
+    path: &str,
+    scene_uuid: [u8; 32],
+    scene_transform: bool,
+    scene_similarity: bool,
+    asset_embedding: bool,
+    asset_transform: bool,
+    fragment_xyz: bool,
+    normal_variance: bool,
+    surface_variation: bool,
+    combined: bool,
+    target_point_count: u32,
+) -> Result<EngineResponse, String> {
+    let command = EngineCommand::tbo_export(
+        path,
+        scene_uuid,
+        scene_transform,
+        scene_similarity,
+        asset_embedding,
+        asset_transform,
+        fragment_xyz,
+        normal_variance,
+        surface_variation,
+        combined,
+        target_point_count,
+    );
     CLIENT.send_command(command)
 }
