@@ -4,6 +4,7 @@ mod engine_api;
 mod engine_client; // This line remains unchanged
 mod mesh_sync_thread;
 mod tbo_export_context;
+mod tbo_writer;
 extern crate iceoryx2_loggers;
 
 use pyo3::prelude::*;
@@ -177,8 +178,18 @@ mod elbo_sdk_rust {
 
     #[pyfunction]
     fn tbo_export_command(
-        path: String,
-        scene_uuid: Vec<u8>,
+        slab_scene_name: Vec<u8>,
+        slab_asset_name: Vec<u8>,
+        slab_fragment_name: Vec<u8>,
+        scene_data_ptr: u64,
+        scene_offset_ptr: u64,
+        scene_remaining: u64,
+        asset_data_ptr: u64,
+        asset_offset_ptr: u64,
+        asset_remaining: u64,
+        frag_data_ptr: u64,
+        frag_offset_ptr: u64,
+        frag_remaining: u64,
         scene_transform: bool,
         scene_similarity: bool,
         asset_embedding: bool,
@@ -188,28 +199,34 @@ mod elbo_sdk_rust {
         surface_variation: bool,
         combined: bool,
         target_point_count: u32,
-    ) -> PyResult<Vec<String>> {
-        let scene_uuid_arr: [u8; 32] = scene_uuid.try_into()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("scene_uuid must be 32 bytes"))?;
+    ) -> PyResult<(u64, u64, u64, u64, u64, u64)> {
+        let slab_scene: [u8; 64] = slab_scene_name.try_into()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("slab_scene_name must be 64 bytes"))?;
+        let slab_asset: [u8; 64] = slab_asset_name.try_into()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("slab_asset_name must be 64 bytes"))?;
+        let slab_fragment: [u8; 64] = slab_fragment_name.try_into()
+            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("slab_fragment_name must be 64 bytes"))?;
         let resp = engine_api::tbo_export_command(
-            &path,
-            scene_uuid_arr,
-            scene_transform,
-            scene_similarity,
-            asset_embedding,
-            asset_transform,
-            fragment_xyz,
-            normal_variance,
-            surface_variation,
-            combined,
+            &slab_scene, &slab_asset, &slab_fragment,
+            scene_data_ptr, scene_offset_ptr, scene_remaining,
+            asset_data_ptr, asset_offset_ptr, asset_remaining,
+            frag_data_ptr, frag_offset_ptr, frag_remaining,
+            scene_transform, scene_similarity,
+            asset_embedding, asset_transform,
+            fragment_xyz, normal_variance,
+            surface_variation, combined,
             target_point_count,
         )
         .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        let filenames = resp.read_tbo_flush()
+        if resp.header.status != 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "tbo_export: buffer full - insufficient space in export buffer".to_string(),
+            ));
+        }
+        let result = resp.read_tbo_export_response()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to read flush response: {}", e),
+                format!("Failed to read export response: {}", e),
             ))?;
-        let result: Vec<String> = filenames.into_iter().map(|s| s.to_string()).collect();
         Ok(result)
     }
 }

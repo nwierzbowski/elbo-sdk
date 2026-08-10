@@ -279,8 +279,18 @@ pub fn group_all_objects_command() -> Result<EngineResponse, String> {
 }
 
 pub fn tbo_export_command(
-    path: &str,
-    scene_uuid: [u8; 32],
+    slab_scene_name: &[u8; 64],
+    slab_asset_name: &[u8; 64],
+    slab_fragment_name: &[u8; 64],
+    scene_data_ptr: u64,
+    scene_offset_ptr: u64,
+    scene_remaining: u64,
+    asset_data_ptr: u64,
+    asset_offset_ptr: u64,
+    asset_remaining: u64,
+    frag_data_ptr: u64,
+    frag_offset_ptr: u64,
+    frag_remaining: u64,
     scene_transform: bool,
     scene_similarity: bool,
     asset_embedding: bool,
@@ -292,8 +302,12 @@ pub fn tbo_export_command(
     target_point_count: u32,
 ) -> Result<EngineResponse, String> {
     let command = EngineCommand::tbo_export(
-        path,
-        scene_uuid,
+        slab_scene_name,
+        slab_asset_name,
+        slab_fragment_name,
+        scene_data_ptr, scene_offset_ptr, scene_remaining,
+        asset_data_ptr, asset_offset_ptr, asset_remaining,
+        frag_data_ptr, frag_offset_ptr, frag_remaining,
         scene_transform,
         scene_similarity,
         asset_embedding,

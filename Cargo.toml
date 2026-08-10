@@ -18,6 +18,7 @@ rand = "0.8"
 iceoryx2-bb-container = "0.8.1"
 iceoryx2-loggers = {version = "0.8.1", features = ["std", "console"]}
 iceoryx2 = "0.8.1"
+bytemuck = "1.14"
 crossbeam = "0.8"
 uuid = { version = "1.20", features = ["v4", "std"] }
 
