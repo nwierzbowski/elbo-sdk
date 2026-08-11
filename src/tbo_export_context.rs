@@ -5,7 +5,6 @@
 //! Context writes header (magic, channel names, entity count) at flush time.
 
 use pyo3::prelude::*;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::asset_sync_context::AssetSyncContext;
 use crate::engine_api;
@@ -14,7 +13,15 @@ use iceoryx2::prelude::{FileName, SemanticString};
 use iceoryx2_bb_posix::file::CreationMode;
 use iceoryx2_bb_posix::shared_memory::{SharedMemory, SharedMemoryBuilder};
 
-static CONTEXT_COUNTER: AtomicU64 = AtomicU64::new(0);
+macro_rules! slab_name {
+    ($name:literal) => {{
+        let mut buf = [0u8; 64];
+        let bytes = $name.as_bytes();
+        let len = bytes.len().min(63);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        buf
+    }};
+}
 
 /// Export format configuration (kept for backward compatibility).
 #[pyclass]
@@ -63,15 +70,6 @@ pub struct TboExportContext {
     pending_allocated_bytes: u64,
 }
 
-fn make_slab_name(prefix: &str, pid: u64, ctx_id: u64) -> [u8; 64] {
-    let name = format!("{}_{}_{}", prefix, pid, ctx_id);
-    let mut buf = [0u8; 64];
-    let bytes = name.as_bytes();
-    let len = bytes.len().min(63);
-    buf[..len].copy_from_slice(&bytes[..len]);
-    buf
-}
-
 fn create_shm(name: &[u8; 64], size: usize) -> Result<SharedMemory, String> {
     let len = name.iter().position(|&b| b == 0).unwrap_or(64);
     let name_str = &name[..len];
@@ -116,8 +114,6 @@ impl TboExportContext {
         target_export_size_mb: f64,
         target_point_count: u32,
     ) -> PyResult<Self> {
-        let ctx_id = CONTEXT_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let pid = std::process::id() as u64;
         let buffer_size = (target_export_size_mb * 1024.0 * 1024.0) as usize;
         let flush_threshold = (max_memory_mb * 1024.0 * 1024.0) as u64;
 
@@ -128,9 +124,9 @@ impl TboExportContext {
             max_memory_mb, target_export_size_mb, target_point_count
         );
 
-        let slab_scene_name = make_slab_name("tbo_scene", pid, ctx_id);
-        let slab_asset_name = make_slab_name("tbo_asset", pid, ctx_id);
-        let slab_fragment_name = make_slab_name("tbo_fragment", pid, ctx_id);
+        let slab_scene_name = slab_name!("tbo_scene");
+        let slab_asset_name = slab_name!("tbo_asset");
+        let slab_fragment_name = slab_name!("tbo_fragment");
 
         let make_buf = |enabled: bool, name: &[u8; 64]| -> Result<Option<FormatBuffer>, String> {
             if !enabled {
@@ -253,9 +249,21 @@ impl TboExportContext {
                 self.target_point_count,
             ) {
                 Ok(resp) => {
+                    let status = resp.header.status;
                     let (s_count, a_count, f_count, s_bytes, a_bytes, f_bytes) =
                         resp.read_tbo_export_response()
                             .map_err(|e| format!("Failed to read export response: {}", e))?;
+
+                    if status != 0 {
+                        let buffer_to_flush = match status {
+                            1 => "scene",
+                            2 => "asset",
+                            3 => "fragment",
+                            _ => return Err(format!("Unknown overflow status: {}", status)),
+                        };
+                        self.flush_format_to_disk(buffer_to_flush)?;
+                        continue;
+                    }
 
                     let s_data_bytes = s_bytes - (s_count * 8);
                     let a_data_bytes = a_bytes - (a_count * 8);
@@ -280,21 +288,17 @@ impl TboExportContext {
                     engine_api::drop_all_groups_command()?;
                     self.accumulated_bytes = 0;
 
-                    // Check if any buffer needs flush
                     let mut flushed = Vec::new();
-                    if s_count > 0 && self.scene_buf.as_ref().map_or(false, |b| b.data_ptr >= b.offset_ptr) {
+                    if s_count > 0 {
                         flushed.extend(self.flush_format_to_disk("scene")?);
                     }
-                    if a_count > 0 && self.asset_buf.as_ref().map_or(false, |b| b.data_ptr >= b.offset_ptr) {
+                    if a_count > 0 {
                         flushed.extend(self.flush_format_to_disk("asset")?);
                     }
-                    if f_count > 0 && self.fragment_buf.as_ref().map_or(false, |b| b.data_ptr >= b.offset_ptr) {
+                    if f_count > 0 {
                         flushed.extend(self.flush_format_to_disk("fragment")?);
                     }
                     return Ok(flushed);
-                }
-                Err(e) if e.contains("buffer full") => {
-                    self.flush_all_buffers_to_disk()?;
                 }
                 Err(e) => return Err(e),
             }
@@ -377,19 +381,6 @@ impl TboExportContext {
         }
 
         Ok(vec![(format_name.to_string(), vec![filename])])
-    }
-
-    fn flush_all_buffers_to_disk(&mut self) -> Result<(), String> {
-        if self.scene_buf.as_ref().map_or(false, |b| b.data_ptr > 0) {
-            let _ = self.flush_format_to_disk("scene")?;
-        }
-        if self.asset_buf.as_ref().map_or(false, |b| b.data_ptr > 0) {
-            let _ = self.flush_format_to_disk("asset")?;
-        }
-        if self.fragment_buf.as_ref().map_or(false, |b| b.data_ptr > 0) {
-            let _ = self.flush_format_to_disk("fragment")?;
-        }
-        Ok(())
     }
 
     fn resolve_channel_names(&self, format_name: &str) -> Vec<String> {
