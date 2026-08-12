@@ -203,7 +203,8 @@ impl TboExportContext {
         }
     }
 
-    fn accumulate(&mut self) -> PyResult<Vec<(String, Vec<String>)>> {
+    #[pyo3(signature = (flush = false))]
+    fn accumulate(&mut self, flush: bool) -> PyResult<Vec<(String, Vec<String>)>> {
         if let Some(mut asset_ctx) = self.pending_asset_ctx.take() {
             asset_ctx.send();
         }
@@ -211,16 +212,29 @@ impl TboExportContext {
         self.accumulated_bytes += self.pending_allocated_bytes;
         self.pending_allocated_bytes = 0;
 
-        if self.accumulated_bytes >= self.flush_threshold {
+        if flush || self.accumulated_bytes >= self.flush_threshold {
             self.do_flush().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
         } else {
             Ok(vec![])
         }
     }
 
-    fn close(&mut self) -> PyResult<()> {
-        self.do_flush().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        Ok(())
+    fn close(&mut self) -> PyResult<Vec<(String, Vec<String>)>> {
+        let mut all_flushed = self.do_flush().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        // Flush only formats that have an active buffer
+        if self.scene_buf.is_some() {
+            all_flushed.extend(self.flush_format_to_disk("scene")
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?);
+        }
+        if self.asset_buf.is_some() {
+            all_flushed.extend(self.flush_format_to_disk("asset")
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?);
+        }
+        if self.fragment_buf.is_some() {
+            all_flushed.extend(self.flush_format_to_disk("fragment")
+                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?);
+        }
+        Ok(all_flushed)
     }
 }
 
@@ -261,7 +275,10 @@ impl TboExportContext {
                             3 => "fragment",
                             _ => return Err(format!("Unknown overflow status: {}", status)),
                         };
-                        self.flush_format_to_disk(buffer_to_flush)?;
+                        let flushed = self.flush_format_to_disk(buffer_to_flush)?;
+                        if !flushed.is_empty() {
+                            return Ok(flushed);
+                        }
                         continue;
                     }
 
@@ -287,18 +304,7 @@ impl TboExportContext {
 
                     engine_api::drop_all_groups_command()?;
                     self.accumulated_bytes = 0;
-
-                    let mut flushed = Vec::new();
-                    if s_count > 0 {
-                        flushed.extend(self.flush_format_to_disk("scene")?);
-                    }
-                    if a_count > 0 {
-                        flushed.extend(self.flush_format_to_disk("asset")?);
-                    }
-                    if f_count > 0 {
-                        flushed.extend(self.flush_format_to_disk("fragment")?);
-                    }
-                    return Ok(flushed);
+                    return Ok(vec![]);
                 }
                 Err(e) => return Err(e),
             }
