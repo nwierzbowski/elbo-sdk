@@ -3,8 +3,7 @@ mod command_thread;
 mod engine_api;
 mod engine_client; // This line remains unchanged
 mod mesh_sync_thread;
-mod tbo_export_context;
-mod tbo_writer;
+mod tbo;
 extern crate iceoryx2_loggers;
 
 use pyo3::prelude::*;
@@ -13,7 +12,7 @@ use pyo3::prelude::*;
 mod elbo_sdk_rust {
     use crate::asset_sync_context::AssetSyncContext;
     use crate::engine_api;
-    use crate::tbo_export_context::{ExportFormat, TboExportContext};
+    use crate::tbo::{TboExportContext, TBOHierarchy, TboImportContext, HierarchicalEntity};
     use pivot_com_types::fields::Uuid;
     use pyo3::prelude::*;
     use std::path::PathBuf;
@@ -166,7 +165,9 @@ mod elbo_sdk_rust {
     #[pymodule_init]
     fn pyinit(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m.add_class::<TboExportContext>()?;
-        m.add_class::<ExportFormat>()?;
+        m.add_class::<TBOHierarchy>()?;
+        m.add_class::<TboImportContext>()?;
+        m.add_class::<HierarchicalEntity>()?;
         Ok(())
     }
 
