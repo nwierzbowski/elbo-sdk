@@ -29,7 +29,7 @@ def organize_objects_command() -> None: ...
 def poll_mesh_sync() -> Optional["AssetSyncContext"]: ...
 
 
-def prepare_standardize_groups(
+def prepare_mesh_send(
     vert_counts: List[int],
     edge_counts: List[int],
     loop_counts: List[int],
@@ -37,9 +37,8 @@ def prepare_standardize_groups(
     object_counts: List[int],
     group_names: List[str],
     surface_contexts: List[int],
-    object_uuids: List[bytes],
-    asset_uuid: bytes,
-) -> "AssetSyncContext": ...
+    asset_uuids: List[bytes],
+) -> Tuple["AssetSyncContext", int]: ...
 
 
 def generate_uuid_bytes() -> bytes: ...
@@ -57,9 +56,12 @@ def set_engine_dir(path: str) -> None: ...
 class AssetSyncContext:
     def uuids(self) -> memoryview: ...
     def surface_contexts(self) -> memoryview: ...
-    def buffers(self, i: int) -> Tuple[memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview, memoryview]: ...
+    def buffers(self, i: int) -> Tuple[
+        memoryview, memoryview, memoryview, memoryview, memoryview,
+        memoryview, memoryview, memoryview, memoryview, memoryview, memoryview,
+    ]: ...
     def size(self) -> int: ...
-    def finalize(self) -> None: ...
+    def send(self) -> None: ...
 
 
 def export_assets_command(path: str, uuids: List[bytes]) -> None: ...
@@ -80,36 +82,6 @@ def standardize_groups_command(uuids: List[bytes]) -> None: ...
 def group_all_objects_command() -> None: ...
 
 
-def tbo_export_command(
-    slab_scene_name: bytes,
-    slab_asset_name: bytes,
-    slab_fragment_name: bytes,
-    scene_data_ptr: int,
-    scene_offset_ptr: int,
-    scene_remaining: int,
-    asset_data_ptr: int,
-    asset_offset_ptr: int,
-    asset_remaining: int,
-    frag_data_ptr: int,
-    frag_offset_ptr: int,
-    frag_remaining: int,
-    scene_transform: bool,
-    scene_similarity: bool,
-    asset_embedding: bool,
-    asset_transform: bool,
-    fragment_xyz: bool,
-    normal_variance: bool,
-    surface_variation: bool,
-    combined: bool,
-    target_point_count: int,
-) -> Tuple[int, int, int, int, int, int]: ...
-
-
-class TboDataBuffer:
-    @property
-    def path(self) -> str: ...
-
-
 class TboImportContext:
     def __init__(self) -> None: ...
     def load_file(self, path: str) -> int: ...
@@ -120,6 +92,13 @@ class TboImportContext:
 
 
 class TboExportContext:
+    """Streaming export context.
+
+    Push geometry batches with prepare_mesh_send() + accumulate(), which also
+    drives the shared-memory TBO export. close() performs the final flush and
+    returns the list of (format_name, [filenames]) written to disk.
+    """
+
     def __init__(
         self,
         output_dir: str,
@@ -145,66 +124,82 @@ class TboExportContext:
         group_names: List[str],
         surface_contexts: List[int],
         asset_uuids: List[bytes],
-    ) -> Tuple[Any, ...]: ...
+    ) -> Tuple[
+        memoryview, memoryview, memoryview, memoryview, memoryview,
+        memoryview, memoryview, memoryview, memoryview, memoryview, memoryview,
+    ]: ...
     def accumulate(self, flush: bool = False) -> List[Tuple[str, List[str]]]: ...
     def close(self) -> List[Tuple[str, List[str]]]: ...
-    def get_hierarchy(self) -> "TBOHierarchy": ...
+    def get_hierarchy(self) -> "TBOHierarchy":
+        """Build a TBOHierarchy over the live export buffers.
 
+        WARNING: The returned hierarchy views shared memory that is overwritten
+        in place by the next flush/accumulate/close call on the corresponding
+        format's buffer. Use it only for inspection between flushes, or copy
+        any data you need to keep. (Import-side hierarchies are safe; they hold
+        Arc references to heap-allocated data.)
+        """
+        ...
 
-# =============================================================================
-# HierarchicalEntity - unified navigation proxy
-# =============================================================================
 
 class HierarchicalEntity:
-    """Unified proxy for navigating the TBO hierarchy.
+    """Cursor over one level of the TBO hierarchy.
 
-    Child navigation uses `get_child(name: str) -> Optional[HierarchicalEntity]`.
-    Returns None for unknown child names or when no data is available.
+    Iteration and indexing yield independent snapshot objects: each element
+    is a distinct cursor positioned at that entity, so ``list(frags)`` and
+    ``frags[i]`` return separate objects. The cursor you iterate over also
+    advances (its ``selected_entity_idx`` reflects the final position after
+    iteration), but the yielded snapshots are independent.
 
-    Top-level entities (hierarchy.Scenes/Assets/Fragments) have no parent data;
-    __getattr__ returns None. Child entities inherit their parent's row data.
+    The cursor reports the selected entity's row count (row_count), its
+    channel layout (channel_names), and per-entity row data via channel()
+    (an (N,) f32 array) and row() (a copied f32 memoryview).
+
+    Child entities can read their parent's selected row by channel name
+    (e.g. asset.sx). Unknown names raise AttributeError, as they do for
+    top-level entities (which have no parent).
 
     Example:
-        hierarchy = ctx.get_hierarchy()
-        for scene in hierarchy.Scenes:
-            assets = scene.get_child("Assets")
-            if assets is None:
-                continue
-            for asset in assets:
-                print(asset.trans_00, asset.similarity)
-                fragments = asset.get_child("Fragments")
-                if fragments is None:
-                    continue
-                for frag in fragments:
-                    print(frag.emb_000)
-                    for pt in frag.get_child("Points") or []:
-                        print(pt.xyz_x, pt.xyz_y, pt.xyz_z)
+        h = ctx.get_hierarchy()
+        for scene in h.Scenes:
+            for asset in scene.get_child("Assets"):
+                print(asset.sx)
+                for frag in asset.get_child("Fragments"):
+                    for pt in frag.get_child("Points"):
+                        x = pt.channel("xyz_x")[0]
     """
     @property
-    def entity_count(self) -> int: ...
+    def row_count(self) -> int: ...
     @property
-    def selected_entity_idx(self) -> int: ...
+    def selected_entity_idx(self) -> int:
+        """Relative index (0..len-1) of the selected entity within this cursor's range."""
+        ...
     @selected_entity_idx.setter
-    def selected_entity_idx(self, idx: int) -> None: ...
+    def selected_entity_idx(self, idx: int) -> None:
+        """Set selection by relative index (0..len-1)."""
+        ...
     @property
     def channel_names(self) -> List[str]: ...
+    def channel(self, name: str) -> np.ndarray: ...
+    def row(self, idx: int) -> memoryview:
+        """Read-only f32 memoryview of one row. The row data is copied into
+        Python-owned bytes, so the view is safe even if the hierarchy is later
+        dropped or the underlying buffer is reset."""
+        ...
     def get_child(self, name: str) -> Optional["HierarchicalEntity"]: ...
     def __len__(self) -> int: ...
     def __iter__(self) -> Iterator["HierarchicalEntity"]: ...
-    def __next__(self) -> Optional["HierarchicalEntity"]: ...
+    def __next__(self) -> "HierarchicalEntity": ...
     def __getitem__(self, idx: int) -> "HierarchicalEntity": ...
-    def __getattr__(self, name: str) -> Optional[float]: ...
+    def __getattr__(self, name: str) -> float: ...
+    def __repr__(self) -> str: ...
 
-
-# =============================================================================
-# Hierarchy - linked three-level access
-# =============================================================================
 
 class TBOHierarchy:
-    """Unified access to the Scene -> Asset -> Fragment -> Points hierarchy.
+    """Linked Scene -> Asset -> Fragment access over loaded TBO data.
 
-    Provides HierarchicalEntity proxies for iteration.
-    Child transitions are configurable; new levels can be added without code changes.
+    Scene rows align 1:1 with asset entities; asset rows align 1:1 with
+    fragment entities. get_hierarchy() rejects file sets that violate this.
     """
     @property
     def Scenes(self) -> HierarchicalEntity: ...
