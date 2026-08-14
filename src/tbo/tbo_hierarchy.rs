@@ -1,12 +1,12 @@
-//! TBO Hierarchy - unified access to the Scene -> Asset -> Fragment -> Points hierarchy.
+//! TBO Hierarchy - unified access to the Scene -> Asset -> Fragment hierarchy.
 //!
-//! Child transitions are stored in a map, allowing new levels to be added
-//! without Rust code changes.
+//! Child transitions are a fixed set, resolved by name in `resolve_child`.
+//! `build_hierarchy` verifies the cross-format alignment invariants (parent
+//! rows == child entities) before exposing the states.
 
 use pyo3::prelude::*;
-use std::collections::HashMap;
 
-use super::tbo_collection::CollectionState;
+use super::tbo_collection::{validate_cross_format, CollectionState, FormatPair};
 use super::tbo_entity::HierarchicalEntity;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -14,22 +14,28 @@ pub enum StateRef {
     Scenes,
     Assets,
     Fragments,
+    /// Terminal level: points are rows of their parent fragment entity, so they
+    /// have no backing collection state of their own.
+    Points,
 }
 
 impl StateRef {
-    pub fn get_state<'a>(&self, h: &'a TBOHierarchy) -> &'a CollectionState {
+    pub fn get_state<'a>(&self, h: &'a TBOHierarchy) -> Option<&'a CollectionState> {
         match self {
-            StateRef::Scenes => &h.scenes_state,
-            StateRef::Assets => &h.assets_state,
-            StateRef::Fragments => &h.fragments_state,
+            StateRef::Scenes => Some(&h.scenes_state),
+            StateRef::Assets => Some(&h.assets_state),
+            StateRef::Fragments => Some(&h.fragments_state),
+            StateRef::Points => None,
         }
     }
 }
 
+/// A contiguous range of entities within one state, plus the state it belongs to.
+#[derive(Clone, Copy)]
 pub struct ChildInfo {
-    pub entity_idx: usize,
-    pub child_offset: usize,
-    pub child_count: usize,
+    /// Range start within the child state (always 0 for Points).
+    pub offset: usize,
+    pub count: usize,
     pub state: StateRef,
 }
 
@@ -38,54 +44,47 @@ pub struct TBOHierarchy {
     pub scenes_state: CollectionState,
     pub assets_state: CollectionState,
     pub fragments_state: CollectionState,
-    child_transitions: HashMap<&'static str, (StateRef, StateRef)>,
+}
+
+/// Build a hierarchy from the three format pairs, in the order scenes, assets,
+/// fragments.
+pub fn build_hierarchy(
+    scenes: FormatPair,
+    assets: FormatPair,
+    fragments: FormatPair,
+) -> PyResult<TBOHierarchy> {
+    TBOHierarchy::new(
+        CollectionState::build(scenes.0, scenes.1)?,
+        CollectionState::build(assets.0, assets.1)?,
+        CollectionState::build(fragments.0, fragments.1)?,
+    )
+}
+
+/// Root cursor over every entity of one state.
+fn root(slf: PyRef<TBOHierarchy>, py: Python, state: StateRef) -> HierarchicalEntity {
+    let total = state
+        .get_state(&slf)
+        .expect("root states always have a backing")
+        .total_entities();
+    let keepalive = unsafe { Py::from_owned_ptr(py, slf.into_ptr()) };
+    HierarchicalEntity::new(py, keepalive, ChildInfo { offset: 0, count: total, state })
 }
 
 #[pymethods]
 impl TBOHierarchy {
     #[getter(Scenes)]
     fn scenes(slf: PyRef<Self>, py: Python) -> HierarchicalEntity {
-        let keepalive = unsafe {
-            let ptr = slf.as_ptr();
-            pyo3::ffi::Py_IncRef(ptr);
-            Py::from_owned_ptr(py, ptr)
-        };
-        let total = slf.scenes_state.total_entities();
-        HierarchicalEntity::new(
-            py, keepalive,
-            ChildInfo { entity_idx: 0, child_offset: 0, child_count: total, state: StateRef::Scenes },
-            None, 0, Vec::new(),
-        )
+        root(slf, py, StateRef::Scenes)
     }
 
     #[getter(Assets)]
     fn assets(slf: PyRef<Self>, py: Python) -> HierarchicalEntity {
-        let keepalive = unsafe {
-            let ptr = slf.as_ptr();
-            pyo3::ffi::Py_IncRef(ptr);
-            Py::from_owned_ptr(py, ptr)
-        };
-        let total = slf.assets_state.total_entities();
-        HierarchicalEntity::new(
-            py, keepalive,
-            ChildInfo { entity_idx: 0, child_offset: 0, child_count: total, state: StateRef::Assets },
-            None, 0, Vec::new(),
-        )
+        root(slf, py, StateRef::Assets)
     }
 
     #[getter(Fragments)]
     fn fragments(slf: PyRef<Self>, py: Python) -> HierarchicalEntity {
-        let keepalive = unsafe {
-            let ptr = slf.as_ptr();
-            pyo3::ffi::Py_IncRef(ptr);
-            Py::from_owned_ptr(py, ptr)
-        };
-        let total = slf.fragments_state.total_entities();
-        HierarchicalEntity::new(
-            py, keepalive,
-            ChildInfo { entity_idx: 0, child_offset: 0, child_count: total, state: StateRef::Fragments },
-            None, 0, Vec::new(),
-        )
+        root(slf, py, StateRef::Fragments)
     }
 
     #[getter(scene_count)]
@@ -109,34 +108,40 @@ impl TBOHierarchy {
         scenes: CollectionState,
         assets: CollectionState,
         fragments: CollectionState,
-    ) -> Self {
-        let mut child_transitions = HashMap::new();
-        child_transitions.insert("Assets", (StateRef::Scenes, StateRef::Assets));
-        child_transitions.insert("Fragments", (StateRef::Assets, StateRef::Fragments));
-        Self {
+    ) -> PyResult<Self> {
+        validate_cross_format(&scenes, &assets, &fragments)?;
+        Ok(Self {
             scenes_state: scenes,
             assets_state: assets,
             fragments_state: fragments,
-            child_transitions,
-        }
+        })
     }
 
-    pub fn resolve_child(&self, name: &str, parent_idx: usize, caller_state: StateRef) -> Option<ChildInfo> {
-        let (parent_state_ref, child_state_ref) = *self.child_transitions.get(name)?;
-        if parent_state_ref != caller_state {
+    pub fn resolve_child(
+        &self,
+        name: &str,
+        parent_idx: usize,
+        caller_state: StateRef,
+    ) -> Option<ChildInfo> {
+        let (expected_parent, child_state) = match name {
+            "Assets" => (StateRef::Scenes, StateRef::Assets),
+            "Fragments" => (StateRef::Assets, StateRef::Fragments),
+            "Points" => (StateRef::Fragments, StateRef::Points),
+            _ => return None,
+        };
+        if expected_parent != caller_state {
             return None;
         }
-        let parent_state = parent_state_ref.get_state(self);
-        let child_offset = parent_state.cumulative_rows_before(parent_idx).ok()?;
-        let child_count = parent_state.entity_row_count(parent_idx).ok()?;
-        if child_count == 0 {
+        let parent_state = expected_parent.get_state(self)?;
+        let offset = parent_state.cumulative_rows_before(parent_idx).ok()?;
+        let count = parent_state.entity_row_count(parent_idx).ok()?;
+        if count == 0 {
             return None;
         }
         Some(ChildInfo {
-            entity_idx: child_offset,
-            child_offset,
-            child_count,
-            state: child_state_ref,
+            offset: if child_state == StateRef::Points { 0 } else { offset },
+            count,
+            state: child_state,
         })
     }
 }
