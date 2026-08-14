@@ -1,11 +1,12 @@
 //! TBO file reader for SDK-side import.
 //!
-//! Reads per-entity data from .tbo files.
-//! Format: [24-byte header][channel names][data][offsets]
-//! Header: [4: magic "TBO\0"][4: format_index][4: version][4: flags][4: entity_count][4: channel_count]
+//! Reads per-entity data from .tbo files (see [`super::format`] for the layout).
+//! Offsets hold entity_count + 1 u64 values, in ascending address order.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+
+use super::format::{self, HEADER_SIZE, TBO_VERSION};
 
 #[derive(Debug)]
 pub struct TboFile {
@@ -19,72 +20,96 @@ pub struct TboFile {
     pub offsets: Vec<u64>,
 }
 
+fn read_u32_le(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
+fn read_null_terminated(reader: &mut BufReader<File>, path: &str) -> Result<String, String> {
+    let mut name = Vec::new();
+    let n = reader
+        .read_until(b'\0', &mut name)
+        .map_err(|e| format!("Failed to read channel name in {}: {}", path, e))?;
+    if n == 0 || name.is_empty() || !name.ends_with(&[0u8]) {
+        return Err(format!("Unexpected end of file in channel names in {}", path));
+    }
+    name.pop();
+    String::from_utf8(name).map_err(|_| format!("Invalid UTF-8 channel name in {}", path))
+}
+
 pub fn read_tbo_file(path: &str) -> Result<TboFile, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
-    let mut reader = file;
+    let mut reader = BufReader::new(file);
 
-    // Read header (24 bytes)
-    let mut header = [0u8; 24];
-    reader.read_exact(&mut header).map_err(|e| format!("Failed to read header: {}", e))?;
+    let mut header = [0u8; HEADER_SIZE];
+    reader
+        .read_exact(&mut header)
+        .map_err(|e| format!("Failed to read header from {}: {}", path, e))?;
 
     let magic = &header[0..4];
-    if magic != b"TBO\0" {
+    if magic != &format::MAGIC[..] {
         return Err(format!("Invalid TBO magic in {}", path));
     }
 
-    let format_index = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
-    let version = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
-    let flags = u32::from_le_bytes([header[12], header[13], header[14], header[15]]);
-    let entity_count = u32::from_le_bytes([header[16], header[17], header[18], header[19]]);
-    let channel_count = u32::from_le_bytes([header[20], header[21], header[22], header[23]]);
+    let format_index = read_u32_le(&header[4..8]);
+    let version = read_u32_le(&header[8..12]);
+    let flags = read_u32_le(&header[12..16]);
+    let entity_count = read_u32_le(&header[16..20]);
+    let channel_count = read_u32_le(&header[20..24]);
 
-    // Read channel names (null-terminated)
-    let mut channel_names = Vec::with_capacity(channel_count as usize);
-    for _ in 0..channel_count {
-        let mut name_bytes = Vec::new();
-        loop {
-            let mut byte = [0u8; 1];
-            reader.read_exact(&mut byte).map_err(|e| format!("Failed to read channel name: {}", e))?;
-            if byte[0] == 0 {
-                break;
-            }
-            name_bytes.push(byte[0]);
-        }
-        channel_names.push(String::from_utf8_lossy(&name_bytes).to_string());
+    if version != TBO_VERSION {
+        return Err(format!(
+            "Unsupported TBO version {} in {} (expected {})",
+            version, path, TBO_VERSION
+        ));
     }
 
-    // Calculate offsets section size
-    let offsets_size = (entity_count as u64) * 8;
+    let mut channel_names = Vec::with_capacity(channel_count as usize);
+    for _ in 0..channel_count {
+        channel_names.push(read_null_terminated(&mut reader, path)?);
+    }
 
-    // Read data (from header_end to file_size - offsets_size)
-    let file_size = reader.seek(SeekFrom::End(0)).map_err(|e| format!("Failed to seek: {}", e))?;
-    let data_start = 24 + channel_names.iter().map(|n| n.len() as u64 + 1).sum::<u64>();
+    let data_start = format::data_start(&channel_names) as u64;
+    let offsets_size = format::offset_count(entity_count as u64) as u64 * 8;
+
+    let file_size = reader
+        .seek(SeekFrom::End(0))
+        .map_err(|e| format!("Failed to seek in {}: {}", path, e))?;
+    if file_size < data_start + offsets_size {
+        return Err(format!(
+            "TBO file {} truncated: size {} smaller than required {}",
+            path,
+            file_size,
+            data_start + offsets_size
+        ));
+    }
     let data_end = file_size - offsets_size;
-    let data_byte_count = (data_end - data_start) as usize;
-    let _data_len = data_byte_count / 4;
+    let data_bytes = (data_end - data_start) as usize;
+    if !data_bytes.is_multiple_of(4) {
+        return Err(format!(
+            "TBO file {} data region ({} bytes) is not a multiple of 4",
+            path, data_bytes
+        ));
+    }
 
-    reader.seek(SeekFrom::Start(data_start)).map_err(|e| format!("Failed to seek: {}", e))?;
+    reader
+        .seek(SeekFrom::Start(data_start))
+        .map_err(|e| format!("Failed to seek data in {}: {}", path, e))?;
 
-    let data_f32_count = data_byte_count / 4;
-    let mut data_u32 = vec![0u32; data_f32_count];
-    reader.read_exact(unsafe {
-        std::slice::from_raw_parts_mut(
-            data_u32.as_mut_ptr() as *mut u8,
-            data_byte_count,
-        )
-    }).map_err(|e| format!("Failed to read data: {}", e))?;
-    let data: Vec<f32> = bytemuck::cast_slice(&data_u32).to_vec();
+    let data_f32_count = data_bytes / 4;
+    let mut data = vec![0f32; data_f32_count];
+    reader
+        .read_exact(unsafe {
+            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data_bytes)
+        })
+        .map_err(|e| format!("Failed to read data in {}: {}", path, e))?;
 
-    // Read offsets (last entity_count * 8 bytes)
-    let offset_u64_count = offsets_size as usize / 8;
-    let mut offset_u64 = vec![0u64; offset_u64_count];
-    reader.read_exact(unsafe {
-        std::slice::from_raw_parts_mut(
-            offset_u64.as_mut_ptr() as *mut u8,
-            offsets_size as usize,
-        )
-    }).map_err(|e| format!("Failed to read offsets: {}", e))?;
-    let offsets: Vec<u64> = offset_u64;
+    let offset_count = (offsets_size / 8) as usize;
+    let mut offsets = vec![0u64; offset_count];
+    reader
+        .read_exact(unsafe {
+            std::slice::from_raw_parts_mut(offsets.as_mut_ptr() as *mut u8, offsets_size as usize)
+        })
+        .map_err(|e| format!("Failed to read offsets in {}: {}", path, e))?;
 
     Ok(TboFile {
         format_index,
