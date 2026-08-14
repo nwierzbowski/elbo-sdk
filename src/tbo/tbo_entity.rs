@@ -1,43 +1,71 @@
 //! Single entity type for hierarchical TBO navigation.
 //!
-//! Uses `get_child(name: &str)` for extensible child navigation, with the
-//! hierarchy's transition map determining valid child types.
+//! A `HierarchicalEntity` is a cursor over one state (scenes, assets,
+//! fragments, or points) of a `TBOHierarchy`. It tracks the selected entity
+//! inside its range (child offset + local index) and exposes the selected
+//! entity's rows: one f32 per (row, channel). `get_child(name)` descends one
+//! level using the hierarchy's transition set.
+//!
+//! Indexing (`__getitem__`) and iteration (`__next__`) return *snapshots*:
+//! independent cursors whose resolved data windows were captured at that
+//! moment.
 
+use pyo3::ffi;
 use pyo3::prelude::*;
+use pyo3::types::{PyBytes, PyFloat};
 
-use super::tbo_hierarchy::{TBOHierarchy, StateRef, ChildInfo};
+use super::tbo_data_view::ChannelSet;
+use super::tbo_hierarchy::{ChildInfo, StateRef, TBOHierarchy};
+use super::{py_attr_error, py_index_error, py_value_error};
 
-struct EntityInner {
-    hierarchy_ref: Py<TBOHierarchy>,
-    entity_idx: usize,
-    local_idx: usize,
+/// The selected entity's resolved data window (zero-copy into backing memory).
+#[derive(Clone)]
+struct Resolved {
     data_ptr: *const f32,
     data_len: usize,
     row_stride: usize,
-    channel_names: Vec<String>,
-    parent_data_ptr: Option<*const f32>,
-    parent_row_stride: usize,
-    parent_row_ptr: *const f32,
-    parent_channel_names: Vec<String>,
-    child_offset: usize,
-    child_count: usize,
-    child_state: StateRef,
-    _keepalive: Py<PyAny>,
+    channels: ChannelSet,
 }
 
-fn keep_hierarchy(py: Python, hierarchy_ref: &Py<TBOHierarchy>) -> Py<PyAny> {
-    unsafe {
-        let ptr = hierarchy_ref.as_ptr();
-        pyo3::ffi::Py_IncRef(ptr);
-        Py::<TBOHierarchy>::from_owned_ptr(py, ptr).into_any()
+impl Resolved {
+    fn row_count(&self) -> usize {
+        self.data_len.checked_div(self.row_stride).unwrap_or(0)
     }
 }
 
-fn child_hierarchy_ref(py: Python, hierarchy_ref: &Py<TBOHierarchy>) -> Py<TBOHierarchy> {
-    unsafe {
-        let ptr = hierarchy_ref.as_ptr();
-        pyo3::ffi::Py_IncRef(ptr);
-        Py::from_owned_ptr(py, ptr)
+/// Access to the parent entity's selected row, carried one level down so
+/// children can read parent attributes (e.g. `asset.sx`) by channel name.
+#[derive(Clone)]
+struct ParentRow {
+    base_ptr: *const f32,
+    row_stride: usize,
+    channels: ChannelSet,
+    row_ptr: *const f32,
+}
+
+struct EntityInner {
+    hierarchy_ref: Py<TBOHierarchy>,
+    /// Range of child entities this cursor navigates.
+    child: ChildInfo,
+    /// Position within the range; `usize::MAX` marks a freshly created iterator.
+    local_idx: usize,
+    /// Global index of the selected entity within `child.state`.
+    entity_idx: usize,
+    resolved: Option<Resolved>,
+    parent: Option<ParentRow>,
+}
+
+impl EntityInner {
+    /// Copy this cursor (refcounting the hierarchy keepalive).
+    fn snapshot(&self, py: Python) -> Self {
+        Self {
+            hierarchy_ref: self.hierarchy_ref.clone_ref(py),
+            child: self.child,
+            local_idx: self.local_idx,
+            entity_idx: self.entity_idx,
+            resolved: self.resolved.clone(),
+            parent: self.parent.clone(),
+        }
     }
 }
 
@@ -45,60 +73,91 @@ impl EntityInner {
     fn new(
         py: Python,
         hierarchy_ref: Py<TBOHierarchy>,
-        child_info: ChildInfo,
-        parent_data_ptr: Option<*const f32>,
-        parent_row_stride: usize,
-        parent_channel_names: Vec<String>,
+        child: ChildInfo,
+        parent: Option<ParentRow>,
     ) -> Self {
-        let keepalive = keep_hierarchy(py, &hierarchy_ref);
-        let (data_ptr, data_len, row_stride, channel_names) =
-            resolve_from_state(child_info.state, &hierarchy_ref, child_info.entity_idx);
-        let parent_row_ptr = parent_data_ptr.unwrap_or(std::ptr::null());
-        Self {
+        let mut this = Self {
             hierarchy_ref,
-            entity_idx: child_info.entity_idx,
+            child,
             local_idx: 0,
-            data_ptr, data_len, row_stride, channel_names,
-            parent_data_ptr, parent_row_stride, parent_row_ptr,
-            parent_channel_names,
-            child_offset: child_info.child_offset,
-            child_count: child_info.child_count,
-            child_state: child_info.state,
-            _keepalive: keepalive,
+            entity_idx: child.offset,
+            resolved: None,
+            parent,
+        };
+        this.resolve(py);
+        this
+    }
+
+    /// Positioned, resolved snapshot cursor at `local_idx`.
+    fn at(&self, py: Python, local_idx: usize) -> Self {
+        let mut this = Self {
+            hierarchy_ref: self.hierarchy_ref.clone_ref(py),
+            child: self.child,
+            local_idx,
+            entity_idx: self.child.offset + local_idx,
+            resolved: None,
+            parent: self.parent.clone(),
+        };
+        this.resolve(py);
+        this
+    }
+
+    /// Iterator cursor: same range, positioned before the first entity.
+    fn iterator(&self, py: Python) -> Self {
+        let mut this = self.snapshot(py);
+        this.local_idx = usize::MAX;
+        this.entity_idx = this.child.offset;
+        this.resolved = None;
+        this
+    }
+
+    /// Resolve the currently selected entity, plus the parent's selected row.
+    fn resolve(&mut self, py: Python) {
+        match self.child.state {
+            StateRef::Points => {
+                let parent = self
+                    .parent
+                    .as_ref()
+                    .expect("points always have a parent");
+                // Points are rows of the parent fragment entity.
+                self.resolved = Some(Resolved {
+                    data_ptr: unsafe { parent.base_ptr.add(self.local_idx * parent.row_stride) },
+                    data_len: parent.row_stride,
+                    row_stride: parent.row_stride,
+                    channels: parent.channels.clone(),
+                });
+            }
+            state => {
+                let resolved = {
+                    let h = self.hierarchy_ref.borrow(py);
+                    state
+                        .get_state(&h)
+                        .and_then(|s| s.resolve_entity(self.entity_idx).ok())
+                };
+                self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels)| Resolved {
+                    data_ptr,
+                    data_len,
+                    row_stride,
+                    channels,
+                });
+            }
+        }
+        if let Some(parent) = self.parent.as_mut() {
+            parent.row_ptr = unsafe { parent.base_ptr.add(self.local_idx * parent.row_stride) };
         }
     }
 
-    fn update_resolved(&mut self) {
-        let resolved = resolve_from_state(self.child_state, &self.hierarchy_ref, self.entity_idx);
-        let (data_ptr, data_len, row_stride, channel_names) = resolved;
-        self.data_ptr = data_ptr;
-        self.data_len = data_len;
-        self.row_stride = row_stride;
-        self.channel_names = channel_names;
-        if let Some(base) = self.parent_data_ptr {
-            self.parent_row_ptr = unsafe { base.add(self.local_idx * self.parent_row_stride) };
+    fn row_count(&self) -> usize {
+        self.resolved.as_ref().map(Resolved::row_count).unwrap_or(0)
+    }
+
+    fn require_data(&self) -> PyResult<()> {
+        match &self.resolved {
+            Some(resolved) if resolved.row_stride > 0 => Ok(()),
+            _ => Err(py_value_error("no data for selected entity")),
         }
     }
-
 }
-
-fn resolve_from_state(
-    state_ref: StateRef,
-    hierarchy_ref: &Py<TBOHierarchy>,
-    entity_idx: usize,
-) -> (*const f32, usize, usize, Vec<String>) {
-    let py = unsafe { Python::assume_attached() };
-    let h = hierarchy_ref.borrow(py);
-    let state = state_ref.get_state(&h);
-    match state.resolve_entity(entity_idx) {
-        Ok((dp, dl, rs, cn)) => (dp, dl, rs, cn.clone()),
-        Err(_) => (std::ptr::null(), 0usize, 0usize, Vec::<String>::new()),
-    }
-}
-
-// ============================================================================
-// HierarchicalEntity
-// ============================================================================
 
 #[pyclass(unsendable)]
 pub struct HierarchicalEntity {
@@ -107,98 +166,154 @@ pub struct HierarchicalEntity {
 
 #[pymethods]
 impl HierarchicalEntity {
-    #[getter(entity_count)]
-    fn entity_count(&self) -> PyResult<usize> {
-        if self.inner.data_len == 0 || self.inner.row_stride == 0 {
-            return Ok(0);
-        }
-        Ok(self.inner.data_len / self.inner.row_stride)
+    /// Number of rows of the selected entity.
+    #[getter(row_count)]
+    fn row_count(&self) -> usize {
+        self.inner.row_count()
     }
 
     #[getter(channel_names)]
     fn channel_names(&self) -> Vec<String> {
-        self.inner.channel_names.clone()
+        self.inner
+            .resolved
+            .as_ref()
+            .map(|r| r.channels.names().clone())
+            .unwrap_or_default()
     }
 
     #[getter(selected_entity_idx)]
     fn selected_entity_idx(&self) -> usize {
-        self.inner.entity_idx
+        self.inner.local_idx
     }
 
     #[setter(selected_entity_idx)]
-    fn set_selected_entity_idx(mut slf: PyRefMut<Self>, idx: usize) {
-        slf.inner.entity_idx = idx;
-        slf.inner.update_resolved();
+    fn set_selected_entity_idx(mut slf: PyRefMut<Self>, idx: usize) -> PyResult<()> {
+        let py = slf.py();
+        if idx >= slf.inner.child.count {
+            return Err(py_index_error("Entity index", idx, slf.inner.child.count));
+        }
+        slf.inner.local_idx = idx;
+        slf.inner.entity_idx = slf.inner.child.offset + idx;
+        slf.inner.resolve(py);
+        Ok(())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "<HierarchicalEntity idx={} rows={} channels={}>",
+            self.inner.local_idx,
+            self.inner.row_count(),
+            self.inner
+                .resolved
+                .as_ref()
+                .map(|r| r.channels.name_count())
+                .unwrap_or(0)
+        )
     }
 
     fn __len__(&self) -> usize {
-        self.inner.child_count
+        self.inner.child.count
     }
 
-    fn __iter__(mut slf: PyRefMut<Self>) -> Py<Self> {
-        slf.inner.local_idx = usize::MAX;
-        unsafe {
-            let ptr = slf.as_ptr();
-            pyo3::ffi::Py_IncRef(ptr);
-            Py::from_owned_ptr(slf.py(), ptr)
-        }
+    fn __iter__(slf: PyRef<Self>) -> PyResult<Py<Self>> {
+        let py = slf.py();
+        Py::new(py, Self { inner: slf.inner.iterator(py) })
     }
 
-    fn __next__(mut slf: PyRefMut<Self>) -> Option<Py<Self>> {
+    /// Advance the iterator; each advance returns an independent snapshot of
+    /// the newly selected entity.
+    fn __next__(mut slf: PyRefMut<Self>) -> Option<PyResult<Py<Self>>> {
+        let py = slf.py();
         slf.inner.local_idx = slf.inner.local_idx.wrapping_add(1);
-        if slf.inner.local_idx >= slf.inner.child_count {
+        if slf.inner.local_idx >= slf.inner.child.count {
             return None;
         }
-        slf.inner.entity_idx = slf.inner.child_offset + slf.inner.local_idx;
-        slf.inner.update_resolved();
+        slf.inner.entity_idx = slf.inner.child.offset + slf.inner.local_idx;
+        slf.inner.resolve(py);
+        Some(Py::new(py, Self { inner: slf.inner.snapshot(py) }))
+    }
+
+    fn __getitem__(slf: PyRef<Self>, idx: usize) -> PyResult<Py<Self>> {
         let py = slf.py();
-        unsafe {
-            let ptr = slf.as_ptr();
-            pyo3::ffi::Py_IncRef(ptr);
-            Some(Py::from_owned_ptr(py, ptr))
+        if idx >= slf.inner.child.count {
+            return Err(py_index_error("Index", idx, slf.inner.child.count));
         }
+        Py::new(py, Self {
+            inner: slf.inner.at(py, idx),
+        })
     }
 
-    fn __getitem__(mut slf: PyRefMut<Self>, idx: usize) -> PyResult<Py<Self>> {
-        if idx >= slf.inner.child_count {
-            return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(
-                format!("Index {} out of range (0..{})", idx, slf.inner.child_count)
-            ));
-        }
-        slf.inner.local_idx = idx;
-        slf.inner.entity_idx = slf.inner.child_offset + idx;
-        slf.inner.update_resolved();
-        unsafe {
-            let ptr = slf.as_ptr();
-            pyo3::ffi::Py_IncRef(ptr);
-            Ok(Py::from_owned_ptr(slf.py(), ptr))
-        }
-    }
-
+    /// Parent-row scalar for the selected entity, addressed by channel name.
+    /// Raises AttributeError for unknown names or when the entity has no parent.
     fn __getattr__(slf: PyRef<Self>, name: &str) -> PyResult<Py<PyAny>> {
-        if slf.inner.parent_data_ptr.is_none() {
-            return Ok(slf.py().None());
+        let parent = slf.inner.parent.as_ref().ok_or_else(|| py_attr_error(name))?;
+        let ch_idx = parent.channels.index(name).ok_or_else(|| py_attr_error(name))?;
+        if parent.row_ptr.is_null() {
+            return Err(py_attr_error(name));
         }
-        if let Some(ch_idx) = slf.inner.parent_channel_names.iter().position(|n| n == name) {
-            let val = unsafe { *slf.inner.parent_row_ptr.add(ch_idx) };
-            return Ok(pyo3::types::PyFloat::new(slf.py(), val as f64).into());
+        let val = unsafe { *parent.row_ptr.add(ch_idx) };
+        Ok(PyFloat::new(slf.py(), val as f64).into())
+    }
+
+    /// All rows of one channel of the selected entity, as an (N,) f32 array.
+    fn channel(slf: PyRef<Self>, py: Python, name: &str) -> PyResult<Py<PyAny>> {
+        let ch_idx = slf
+            .inner
+            .resolved
+            .as_ref()
+            .and_then(|r| r.channels.index(name))
+            .ok_or_else(|| py_value_error(format!("Unknown channel: {name}")))?;
+        slf.inner.require_data()?;
+        let resolved = slf.inner.resolved.as_ref().expect("require_data checked");
+        let rows = resolved.row_count();
+        let base = resolved.data_ptr;
+        let stride = resolved.row_stride;
+        let mut out = Vec::with_capacity(rows);
+        for r in 0..rows {
+            out.push(unsafe { *base.add(r * stride + ch_idx) });
         }
-        Ok(slf.py().None())
+        let arr = numpy::PyArray1::<f32>::from_vec(py, out);
+        Ok(arr.into_any().unbind())
+    }
+
+    /// Read-only f32 memoryview of one row (channel_count f32) of the selected
+    /// entity. The row is copied into Python-owned bytes, so the view is safe
+    /// even if the hierarchy is later dropped or the buffer is reset.
+    fn row(slf: PyRef<Self>, py: Python, idx: usize) -> PyResult<Py<PyAny>> {
+        slf.inner.require_data()?;
+        let rows = slf.inner.row_count();
+        if idx >= rows {
+            return Err(py_index_error("Row index", idx, rows));
+        }
+        let resolved = slf.inner.resolved.as_ref().expect("require_data checked");
+        let ptr = unsafe { resolved.data_ptr.add(idx * resolved.row_stride) };
+        let row_bytes =
+            unsafe { std::slice::from_raw_parts(ptr as *const u8, resolved.row_stride * 4) };
+        let bytes = PyBytes::new(py, row_bytes);
+        let mv = unsafe { ffi::PyMemoryView_FromObject(bytes.as_ptr()) };
+        if mv.is_null() {
+            return Err(super::py_runtime_error("failed to create memoryview from row"));
+        }
+        let view: Py<PyAny> = unsafe { Py::from_owned_ptr(py, mv) };
+        Ok(view)
     }
 
     #[pyo3(name = "get_child")]
     fn get_child(slf: PyRef<Self>, py: Python, name: &str) -> Option<Self> {
         let h = slf.inner.hierarchy_ref.borrow(py);
-        let info = h.resolve_child(name, slf.inner.entity_idx, slf.inner.child_state)?;
+        let info = h
+            .resolve_child(name, slf.inner.entity_idx, slf.inner.child.state)?;
         drop(h);
-        Some(Self::new(
-            py,
-            child_hierarchy_ref(py, &slf.inner.hierarchy_ref),
-            info,
-            Some(slf.inner.data_ptr),
-            slf.inner.row_stride,
-            slf.inner.channel_names.clone(),
-        ))
+
+        let parent = slf.inner.resolved.as_ref().map(|r| ParentRow {
+            base_ptr: r.data_ptr,
+            row_stride: r.row_stride,
+            channels: r.channels.clone(),
+            row_ptr: std::ptr::null(),
+        });
+        Some(Self {
+            inner: EntityInner::new(py, slf.inner.hierarchy_ref.clone_ref(py), info, parent),
+        })
     }
 }
 
@@ -207,14 +322,9 @@ impl HierarchicalEntity {
         py: Python,
         hierarchy_ref: Py<TBOHierarchy>,
         child_info: ChildInfo,
-        parent_data_ptr: Option<*const f32>,
-        parent_row_stride: usize,
-        parent_channel_names: Vec<String>,
     ) -> Self {
-        let inner = EntityInner::new(
-            py, hierarchy_ref, child_info,
-            parent_data_ptr, parent_row_stride, parent_channel_names,
-        );
-        Self { inner }
+        Self {
+            inner: EntityInner::new(py, hierarchy_ref, child_info, None),
+        }
     }
 }
