@@ -7,6 +7,10 @@ use std::{os::raw::c_char, ptr::NonNull};
 
 use crate::engine_api;
 
+// SAFETY: the slices point into engine-owned shared memory that is explicitly
+// shared across threads (the engine writes it, Python threads read it).
+unsafe impl Send for AssetSyncContext {}
+
 #[pyclass(unsendable)]
 pub struct AssetSyncContext {
     asset_slices: Vec<AssetDataSlices>,
@@ -16,6 +20,13 @@ pub struct AssetSyncContext {
 }
 
 impl AssetSyncContext {
+    pub fn send_command(&mut self, py: Python) -> PyResult<()> {
+        let ptrs = std::mem::take(&mut self.asset_ptrs);
+        py.detach(move || engine_api::send_mesh_command(ptrs))
+            .map_err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>)?;
+        Ok(())
+    }
+
     pub fn new(ptrs: Vec<NonNull<AssetMeta>>, asset_ptrs: &[AssetPtr]) -> AssetSyncContext {
         let mut asset_slices = Vec::with_capacity(ptrs.len());
         let mut asset_uuids = Vec::with_capacity(ptrs.len());
@@ -108,12 +119,8 @@ impl AssetSyncContext {
         self.asset_slices.len()
     }
 
-    pub fn send(&mut self) -> () {
-        let response = engine_api::send_mesh_command(std::mem::take(&mut self.asset_ptrs));
-
-        if response.is_err() {
-            println!("{:?}", response.err());
-        }
+    pub fn send(mut slf: PyRefMut<Self>, py: Python) -> PyResult<()> {
+        slf.send_command(py)
     }
 }
 
