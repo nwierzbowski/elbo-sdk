@@ -66,13 +66,11 @@ pub fn spawn_command_thread(
                     cmd_notifier
                         .notify()
                         .map_err(|e| format!("Notifier failed: {}", e))?;
-                    loop {
-                        if let Some(res) = pending.receive().map_err(|e| e.to_string())? {
-                            return Ok(res.payload().clone());
-                        }
-                        // Tiny sleep to prevent 100% CPU during the microsecond wait
-                        thread::sleep(std::time::Duration::from_micros(100));
-                    }
+                    let res = pending
+                        .receive()
+                        .map_err(|e| format!("Receive failed: {}", e))?
+                        .ok_or_else(|| "Engine closed the request without a response".to_string())?;
+                    Ok(*res.payload())
                 })();
 
                 let _ = work.response_tx.send(result);
