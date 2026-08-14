@@ -1,43 +1,76 @@
-//! TBO Export Context - SDK-side orchestrator for streaming export.
+//! Streaming TBO export context (pyo3).
 //!
-//! Buffer layout: [24-byte header][channel names][data: grows →] ... gap ... [offsets: ← grows]
-//! Header: [4: magic][4: format_index][4: version][4: flags][4: entity_count][4: channel_count]
-//! Engine writes raw f32 data at data_ptr and u64 offsets at offset_ptr.
-//! The LoadedFile structs ARE the buffer handles — created on open, updated on each write,
-//! and always accessible for native data access.
+//! Each enabled format (scene/asset/fragment) owns one iceoryx slab laid out as
+//! `[24-byte header][channel names][padding][data: grows →] … [offsets: ← grows]`.
+//! The engine fills the slabs during a `tbo_export_command` round-trip
+//! ([`TboExportContext::do_flush`]); geometry reaches the engine through
+//! `prepare_mesh_send` + `accumulate` (allocate-memory path).
+
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 
 use crate::asset_sync_context::AssetSyncContext;
 use crate::engine_api;
-use super::tbo_file::LoadedFile;
-use super::tbo_data_view::DataView;
-use super::tbo_collection::CollectionState;
+
+use super::buffer::{self, FormatBuffer, ShmKeep};
+use super::format;
+use super::tbo_collection::{DataBacking, FormatPair};
+use super::tbo_data_view::{ChannelSet, DataView};
+use super::tbo_hierarchy::{build_hierarchy, TBOHierarchy};
 use super::tbo_writer;
-use iceoryx2::prelude::{FileName, SemanticString};
-use iceoryx2_bb_posix::file::CreationMode;
-use iceoryx2_bb_posix::shared_memory::{SharedMemory, SharedMemoryBuilder};
+use super::{py_runtime_error, py_value_error};
 
-macro_rules! slab_name {
-    ($name:literal) => {{
-        let mut buf = [0u8; 64];
-        let bytes = $name.as_bytes();
-        let len = bytes.len().min(63);
-        buf[..len].copy_from_slice(&bytes[..len]);
-        buf
-    }};
+/// Identity of one export format, in the engine/protocol order
+/// `[scene, asset, fragment]` (slab arrays and response counts match it).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormatKey {
+    Scene,
+    Asset,
+    Fragment,
 }
 
-struct FormatBuffer {
-    shm: SharedMemory,
-    data_ptr: usize,
-    offset_ptr: usize,
-    data_start: usize,
-    buffer_size: usize,
-    remaining: usize,
+impl FormatKey {
+    const ALL: [FormatKey; 3] = [FormatKey::Scene, FormatKey::Asset, FormatKey::Fragment];
+
+    /// Engine overflow-response status value identifying this format.
+    fn from_overflow_status(status: u16) -> Option<Self> {
+        match status {
+            1 => Some(FormatKey::Scene),
+            2 => Some(FormatKey::Asset),
+            3 => Some(FormatKey::Fragment),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            FormatKey::Scene => "scene",
+            FormatKey::Asset => "asset",
+            FormatKey::Fragment => "fragment",
+        }
+    }
+
+    /// `format_index` stored in the TBO header.
+    fn index(self) -> u32 {
+        self as u32
+    }
 }
 
-// ── TboExportContext ─────────────────────────────────────────────────────────
+/// One format's export slot: its slab name and (if enabled) live buffer.
+struct FormatSlot {
+    buf: Option<FormatBuffer>,
+    name: [u8; 64],
+}
+
+impl FormatSlot {
+    fn inactive() -> Self {
+        Self {
+            buf: None,
+            name: [0u8; 64],
+        }
+    }
+}
 
 #[pyclass(unsendable)]
 pub struct TboExportContext {
@@ -51,134 +84,281 @@ pub struct TboExportContext {
     surface_variation: bool,
     combined: bool,
     target_point_count: u32,
+    /// Bytes queued via `accumulate` since the last flush.
     accumulated_bytes: u64,
+    /// Auto-flush threshold derived from `max_memory_mb`.
     flush_threshold: u64,
-    scene_buf: Option<FormatBuffer>,
-    asset_buf: Option<FormatBuffer>,
-    fragment_buf: Option<FormatBuffer>,
-    slab_scene_name: [u8; 64],
-    slab_asset_name: [u8; 64],
-    slab_fragment_name: [u8; 64],
+    /// Slots in [scene, asset, fragment] order (see [`FormatKey::ALL`]).
+    slots: [FormatSlot; 3],
+    /// Allocate-memory batch staged by `prepare_mesh_send`, sent on `accumulate`.
     pending_asset_ctx: Option<AssetSyncContext>,
     pending_allocated_bytes: u64,
-    scene_file: Option<LoadedFile>,
-    asset_file: Option<LoadedFile>,
-    fragment_file: Option<LoadedFile>,
 }
 
-fn create_shm(name: &[u8; 64], size: usize) -> Result<SharedMemory, String> {
-    let len = name.iter().position(|&b| b == 0).unwrap_or(64);
-    let name_str = &name[..len];
-    let file_name = FileName::new(name_str)
-        .map_err(|e| format!("Invalid SHM name: {:?}", e))?;
-    SharedMemoryBuilder::new(&file_name)
-        .is_memory_locked(false)
-        .creation_mode(CreationMode::PurgeAndCreate)
-        .size(size)
-        .create()
-        .map_err(|e| format!("Failed to create SHM: {:?}", e))
-}
-
-fn create_loaded_file(
-    format_name: &str,
-    format_index: u32,
-    channel_names: Vec<String>,
-    _buf: &FormatBuffer,
-) -> LoadedFile {
-    let channel_count = channel_names.len() as u32;
-    LoadedFile {
-        path: format_name.to_string(),
-        data_len: 0,
-        offset_len: 0,
-        channel_names: channel_names.clone(),
-        format_index,
-        version: 0,
-        flags: 0,
-        entity_count: 0,
-        channel_count,
-        data_holder_index: None,
-    }
-}
-
-fn make_buf(
-    buffer_size: usize,
-    name: &[u8; 64],
-    channel_names: &[String],
-    format_index: u32,
-    format_name: &str,
-) -> Result<(FormatBuffer, LoadedFile), String> {
-    let shm = create_shm(name, buffer_size)?;
-    let header_size = 24;
-    let names_size: usize = channel_names.iter().map(|n| n.len() + 1).sum();
-    let data_start = header_size + names_size;
-
-    let mut fmt_buf = FormatBuffer {
-        shm,
-        data_ptr: data_start,
-        offset_ptr: buffer_size,
-        data_start,
-        buffer_size,
-        remaining: buffer_size - data_start,
-    };
-
-    let mut loaded_file = create_loaded_file(
-        match format_index {
-            0 => "scene",
-            1 => "asset",
-            2 => "fragment",
-            _ => "unknown",
-        },
-        format_index,
-        channel_names.to_vec(),
-        &fmt_buf,
-    );
-
-    reset_format(&mut fmt_buf, &mut loaded_file, format_name);
-
-    Ok((fmt_buf, loaded_file))
-}
-
-fn reset_format(buf: &mut FormatBuffer, file: &mut LoadedFile, format_name: &str) {
-    buf.data_ptr = buf.data_start;
-    buf.offset_ptr = buf.buffer_size;
-    buf.remaining = buf.buffer_size - buf.data_start;
-
-    let format_index = match format_name {
-        "scene" => 0,
-        "asset" => 1,
-        "fragment" => 2,
-        _ => return,
-    };
-
-    let base = buf.shm.base_address().as_ptr() as usize;
-    unsafe {
-        let ptr = base as *mut u8;
-        std::ptr::write_unaligned(ptr.add(0) as *mut u32, 0x004F4254);
-        std::ptr::write_unaligned(ptr.add(4) as *mut u32, format_index);
-        std::ptr::write_unaligned(ptr.add(8) as *mut u32, 3);
-        std::ptr::write_unaligned(ptr.add(12) as *mut u32, 0);
-        std::ptr::write_unaligned(ptr.add(16) as *mut u32, 0);
-        std::ptr::write_unaligned(ptr.add(20) as *mut u32, file.channel_names.len() as u32);
-        let mut offset = 24;
-        for name in &file.channel_names {
-            let bytes = name.as_bytes();
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(offset), bytes.len());
-            offset += bytes.len();
-            *ptr.add(offset) = 0;
-            offset += 1;
+impl TboExportContext {
+    fn enabled(&self, key: FormatKey) -> bool {
+        match key {
+            FormatKey::Scene => self.scene_transform || self.scene_similarity,
+            FormatKey::Asset => self.asset_embedding || self.asset_transform,
+            FormatKey::Fragment => {
+                self.fragment_xyz || self.normal_variance || self.surface_variation || self.combined
+            }
         }
-        // Write first offset (data_start) and decrement offset_ptr
-        *((base + buf.buffer_size - 8) as *mut u64) = buf.data_start as u64;
-        buf.offset_ptr -= 8;
     }
-    file.data_len = 0;
-    file.offset_len = 0;
-    file.entity_count = 0;
+
+    /// Channel layout for a format, from this context's enable flags.
+    fn resolve_channel_names(&self, key: FormatKey) -> Vec<String> {
+        let mut names = Vec::new();
+        match key {
+            FormatKey::Scene => {
+                if self.scene_transform {
+                    for i in 0..16 {
+                        names.push(format!("trans_{:02}", i));
+                    }
+                }
+                if self.scene_similarity {
+                    names.push("similarity".to_string());
+                }
+            }
+            FormatKey::Asset => {
+                if self.asset_embedding {
+                    for i in 0..256 {
+                        names.push(format!("emb_{:03}", i));
+                    }
+                }
+                if self.asset_transform {
+                    for i in 0..16 {
+                        names.push(format!("trans_{:02}", i));
+                    }
+                }
+            }
+            FormatKey::Fragment => {
+                if self.fragment_xyz {
+                    names.push("xyz_x".to_string());
+                    names.push("xyz_y".to_string());
+                    names.push("xyz_z".to_string());
+                }
+                if self.normal_variance {
+                    names.push("normal_variance".to_string());
+                }
+                if self.surface_variation {
+                    names.push("surface_variation".to_string());
+                }
+                if self.combined {
+                    names.push("combined".to_string());
+                }
+            }
+        }
+        names
+    }
+
+    /// Create the slab and initial buffer for one enabled format.
+    fn enable(&mut self, key: FormatKey, buffer_size: usize) -> PyResult<()> {
+        if !self.enabled(key) {
+            return Ok(());
+        }
+        let name = buffer::unique_slab_name(key.name());
+        let channels = ChannelSet::from_names(self.resolve_channel_names(key));
+        let shm = buffer::create_shm(&name, buffer_size).map_err(py_runtime_error)?;
+        let buf = FormatBuffer::new(shm, buffer_size, key.index(), channels).map_err(py_runtime_error)?;
+        self.slots[key as usize] = FormatSlot {
+            buf: Some(buf),
+            name,
+        };
+        Ok(())
+    }
+
+    fn slot(&self, key: FormatKey) -> &FormatSlot {
+        &self.slots[key as usize]
+    }
+
+    fn slot_mut(&mut self, key: FormatKey) -> &mut FormatSlot {
+        &mut self.slots[key as usize]
+    }
+
+    /// One engine round-trip: send the export command (the engine blocks
+    /// until it has written the queued entities) and interpret the response.
+    fn run_export_command(&self, py: Python) -> PyResult<(u16, EngineCounts)> {
+        let mut data = [0u64; 3];
+        let mut offset = [0u64; 3];
+        let mut remaining = [0u64; 3];
+        for (i, slot) in self.slots.iter().enumerate() {
+            if let Some(buf) = &slot.buf {
+                // Slab-relative byte offsets, as the engine expects.
+                data[i] = buf.data_ptr as u64;
+                offset[i] = buf.offset_ptr() as u64;
+                remaining[i] = buf.remaining() as u64;
+            }
+        }
+
+        // Everything the closure needs copied into locals: `detach` runs it
+        // off-thread, so it must not capture the context (SHM holders are !Send).
+        let names: [[u8; 64]; 3] = [
+            self.slots[0].name,
+            self.slots[1].name,
+            self.slots[2].name,
+        ];
+        let (
+            scene_transform,
+            scene_similarity,
+            asset_embedding,
+            asset_transform,
+            fragment_xyz,
+            normal_variance,
+            surface_variation,
+            combined,
+            target_point_count,
+        ) = (
+            self.scene_transform,
+            self.scene_similarity,
+            self.asset_embedding,
+            self.asset_transform,
+            self.fragment_xyz,
+            self.normal_variance,
+            self.surface_variation,
+            self.combined,
+            self.target_point_count,
+        );
+
+        let resp = py
+            .detach(|| {
+                engine_api::tbo_export_command(
+                    &names[0], &names[1], &names[2],
+                    data[0], offset[0], remaining[0],
+                    data[1], offset[1], remaining[1],
+                    data[2], offset[2], remaining[2],
+                    scene_transform,
+                    scene_similarity,
+                    asset_embedding,
+                    asset_transform,
+                    fragment_xyz,
+                    normal_variance,
+                    surface_variation,
+                    combined,
+                    target_point_count,
+                )
+            })
+            .map_err(py_runtime_error)?;
+
+        let status = resp.header.status;
+        let (sc, ac, fc, sb, ab, fb) = resp
+            .read_tbo_export_response()
+            .map_err(|e| py_runtime_error(format!("Failed to read export response: {e}")))?;
+        Ok((status, EngineCounts {
+            counts: [sc, ac, fc],
+            reported_bytes: [sb, ab, fb],
+        }))
+    }
+
+    /// Flush to disk in a loop until the engine reports all queued points done.
+    /// Returns any intermediate .tbo files written on overflow.
+    fn do_flush(&mut self, py: Python) -> PyResult<Vec<(String, Vec<String>)>> {
+        loop {
+            let (status, r) = self.run_export_command(py)?;
+            if status != 0 {
+                let key = FormatKey::from_overflow_status(status)
+                    .ok_or_else(|| py_runtime_error(format!("Unknown overflow status: {status}")))?;
+                let flushed = self.flush_format_to_disk(key)?;
+                if flushed.is_empty() {
+                    return Err(py_runtime_error(format!(
+                        "Engine reported {} buffer overflow but the buffer holds no flushed data; \
+                         the export buffer is too small for a single batch",
+                        key.name()
+                    )));
+                }
+                continue;
+            }
+
+            let mut data_bytes = [0u64; 3];
+            for (i, key) in FormatKey::ALL.iter().enumerate() {
+                data_bytes[i] = r.reported_bytes[i]
+                    .checked_sub(r.counts[i] * 8)
+                    .ok_or_else(|| {
+                        py_runtime_error(format!(
+                            "{} buffer: reported bytes less than offset space",
+                            key.name()
+                        ))
+                    })?;
+                if let Some(buf) = self.slot_mut(*key).buf.as_mut() {
+                    buf.advance(data_bytes[i], r.counts[i]).map_err(py_runtime_error)?;
+                }
+            }
+
+            py.detach(engine_api::drop_all_groups_command)
+                .map_err(py_runtime_error)?;
+            self.accumulated_bytes = 0;
+            return Ok(vec![]);
+        }
+    }
+
+    /// Flush one format's buffer to a .tbo file and reset it. Returns the
+    /// files written (empty when the buffer holds no data).
+    fn flush_format_to_disk(&mut self, key: FormatKey) -> PyResult<Vec<(String, Vec<String>)>> {
+        let buf = self
+            .slot(key)
+            .buf
+            .as_ref()
+            .ok_or_else(|| py_runtime_error(format!("No {} buffer", key.name())))?;
+        let base = buf.shm.base_address().as_ptr() as usize;
+        if buf.is_empty() {
+            return Ok(vec![]);
+        }
+
+        format::set_entity_count(base as *mut u8, buf.entity_count() as u32);
+        let filename = tbo_writer::write_tbo_file(
+            unsafe { std::slice::from_raw_parts(base as *const u8, buf.buffer_size) },
+            buf.data_ptr,
+            buf.offset_region_start(),
+            &self.output_dir,
+            key.name(),
+        )
+        .map_err(py_runtime_error)?;
+
+        self.slot_mut(key)
+            .buf
+            .as_mut()
+            .expect("buffer checked above")
+            .reset();
+
+        Ok(vec![(key.name().to_string(), vec![filename])])
+    }
+
+    /// Zero-copy views of one format's buffer plus an independent keepalive
+    /// mapping. Disabled formats yield empty views.
+    fn format_views(&self, key: FormatKey) -> PyResult<FormatPair> {
+        let Some(buf) = self.slot(key).buf.as_ref() else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let base = buf.shm.base_address().as_ptr() as usize;
+        let view = DataView::new(
+            (base + buf.data_start) as *const f32,
+            buf.data_len_f32(),
+            (base + buf.offset_region_start()) as *const u64,
+            buf.offset_len(),
+            buf.data_start as u64,
+            buf.channels.clone(),
+        );
+        let mapping = buffer::open_shm_mapping(&self.slot(key).name).map_err(py_runtime_error)?;
+        // Not Sync: the backing is only ever read on the (single) Python thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let backing: DataBacking = Arc::new(ShmKeep(mapping));
+        Ok((vec![view], vec![backing]))
+    }
+}
+
+/// Entity counts and total reported bytes (data + offsets) per format,
+/// in [scene, asset, fragment] order.
+struct EngineCounts {
+    counts: [u64; 3],
+    reported_bytes: [u64; 3],
 }
 
 #[pymethods]
 impl TboExportContext {
+    /// Create a streaming export context. Enabled formats get a live buffer of
+    /// `target_export_size_mb` each; `max_memory_mb` is the auto-flush threshold.
     #[new]
+    #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         output_dir,
         scene_transform,
@@ -217,11 +397,6 @@ impl TboExportContext {
             max_memory_mb, target_export_size_mb, target_point_count
         );
 
-        let slab_scene_name = slab_name!("tbo_scene");
-        let slab_asset_name = slab_name!("tbo_asset");
-        let slab_fragment_name = slab_name!("tbo_fragment");
-
-        // Build self incrementally so we can call resolve_channel_names
         let mut ctx = Self {
             output_dir,
             scene_transform,
@@ -235,49 +410,23 @@ impl TboExportContext {
             target_point_count,
             accumulated_bytes: 0,
             flush_threshold,
-            scene_buf: None,
-            asset_buf: None,
-            fragment_buf: None,
-            slab_scene_name,
-            slab_asset_name,
-            slab_fragment_name,
+            slots: [
+                FormatSlot::inactive(),
+                FormatSlot::inactive(),
+                FormatSlot::inactive(),
+            ],
             pending_asset_ctx: None,
             pending_allocated_bytes: 0,
-            scene_file: None,
-            asset_file: None,
-            fragment_file: None,
         };
-
-        // Create scene buffer with correct channel names
-        if ctx.scene_transform || ctx.scene_similarity {
-            let channel_names = ctx.resolve_channel_names("scene");
-            let (buf, file) = make_buf(buffer_size, &ctx.slab_scene_name, &channel_names, 0, "scene")
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-            ctx.scene_buf = Some(buf);
-            ctx.scene_file = Some(file);
+        for key in FormatKey::ALL {
+            ctx.enable(key, buffer_size)?;
         }
-
-        // Create asset buffer with correct channel names
-        if ctx.asset_embedding || ctx.asset_transform {
-            let channel_names = ctx.resolve_channel_names("asset");
-            let (buf, file) = make_buf(buffer_size, &ctx.slab_asset_name, &channel_names, 1, "asset")
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-            ctx.asset_buf = Some(buf);
-            ctx.asset_file = Some(file);
-        }
-
-        // Create fragment buffer with correct channel names
-        if ctx.fragment_xyz || ctx.normal_variance || ctx.surface_variation || ctx.combined {
-            let channel_names = ctx.resolve_channel_names("fragment");
-            let (buf, file) = make_buf(buffer_size, &ctx.slab_fragment_name, &channel_names, 2, "fragment")
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-            ctx.fragment_buf = Some(buf);
-            ctx.fragment_file = Some(file);
-        }
-
         Ok(ctx)
     }
 
+    /// Stage an allocate-memory batch for the engine; `accumulate()` sends it.
+    /// Returns 11 Python buffers to fill with the geometry.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     fn prepare_mesh_send(
         &mut self,
         py: Python,
@@ -293,309 +442,75 @@ impl TboExportContext {
         Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>,
         Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>, Py<PyAny>,
     )> {
-        let (asset_ctx, allocated_bytes) = crate::engine_api::allocate_memory(
-            vert_counts, edge_counts, loop_counts, total_loop_lengths,
-            object_counts, group_names, surface_contexts, asset_uuids.clone(),
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
+        if self.pending_asset_ctx.is_some() {
+            return Err(py_value_error(
+                "pending asset batch not consumed; call accumulate() before the next prepare_mesh_send()",
+            ));
+        }
+
+        let (asset_ctx, allocated_bytes) = py
+            .detach(|| {
+                engine_api::allocate_memory(
+                    vert_counts, edge_counts, loop_counts, total_loop_lengths,
+                    object_counts, group_names, surface_contexts, asset_uuids,
+                )
+            })
+            .map_err(py_runtime_error)?;
 
         self.pending_asset_ctx = Some(asset_ctx);
         self.pending_allocated_bytes = allocated_bytes;
 
-        if let Some(ref mut ctx) = self.pending_asset_ctx {
-            ctx.buffers(py, 0)
-        } else {
-            unreachable!()
-        }
+        self.pending_asset_ctx
+            .as_ref()
+            .expect("pending context just set")
+            .buffers(py, 0)
     }
 
+    /// Send the staged batch and drive a TBO export of everything queued.
+    /// Flushes to disk when `flush` is set or the memory threshold is reached.
     #[pyo3(signature = (flush = false))]
-    fn accumulate(&mut self, flush: bool) -> PyResult<Vec<(String, Vec<String>)>> {
+    fn accumulate(&mut self, py: Python, flush: bool) -> PyResult<Vec<(String, Vec<String>)>> {
         if let Some(mut asset_ctx) = self.pending_asset_ctx.take() {
-            asset_ctx.send();
+            asset_ctx.send_command(py)?;
         }
 
         self.accumulated_bytes += self.pending_allocated_bytes;
         self.pending_allocated_bytes = 0;
 
         if flush || self.accumulated_bytes >= self.flush_threshold {
-            self.do_flush().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))
+            self.do_flush(py)
         } else {
             Ok(vec![])
         }
     }
 
-    fn close(&mut self) -> PyResult<Vec<(String, Vec<String>)>> {
-        let mut all_flushed = self.do_flush().map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        // Flush only formats that have an active buffer
-        if self.scene_buf.is_some() {
-            all_flushed.extend(self.flush_format_to_disk("scene")
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?);
-        }
-        if self.asset_buf.is_some() {
-            all_flushed.extend(self.flush_format_to_disk("asset")
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?);
-        }
-        if self.fragment_buf.is_some() {
-            all_flushed.extend(self.flush_format_to_disk("fragment")
-                .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?);
+    /// Final flush: drive remaining exports and write all non-empty buffers to
+    /// disk. Returns the files written per format.
+    fn close(&mut self, py: Python) -> PyResult<Vec<(String, Vec<String>)>> {
+        // No data written -> engine has nothing to export; skip the
+        // blocking round-trip entirely.
+        let any_data = self
+            .slots
+            .iter()
+            .any(|s| s.buf.as_ref().is_some_and(|b| !b.is_empty()));
+        let mut all_flushed = if any_data { self.do_flush(py)? } else { vec![] };
+
+        for key in FormatKey::ALL {
+            if self.slot(key).buf.is_some() {
+                all_flushed.extend(self.flush_format_to_disk(key)?);
+            }
         }
         Ok(all_flushed)
     }
 
-    /// Build a TBOHierarchy linking scene, asset, and fragment collections.
-    fn get_hierarchy(&self, _py: Python) -> PyResult<super::tbo_hierarchy::TBOHierarchy> {
-        let scenes = self.scene_file.as_ref()
-            .map(|file| {
-                let buf = self.scene_buf.as_ref().unwrap();
-                let base = buf.shm.base_address().as_ptr() as usize;
-                let data_ptr = (base + buf.data_start) as *const f32;
-                let offsets_ptr = (base + buf.data_start + file.data_len * 4) as *const u64;
-                DataView::new(
-                    data_ptr,
-                    file.data_len,
-                    offsets_ptr,
-                    file.offset_len,
-                    buf.data_start as u64,
-                    file.channel_names.clone(),
-                )
-            });
-        let assets = self.asset_file.as_ref()
-            .map(|file| {
-                let buf = self.asset_buf.as_ref().unwrap();
-                let base = buf.shm.base_address().as_ptr() as usize;
-                let data_ptr = (base + buf.data_start) as *const f32;
-                let offsets_ptr = (base + buf.data_start + file.data_len * 4) as *const u64;
-                DataView::new(
-                    data_ptr,
-                    file.data_len,
-                    offsets_ptr,
-                    file.offset_len,
-                    buf.data_start as u64,
-                    file.channel_names.clone(),
-                )
-            });
-        let fragments = self.fragment_file.as_ref()
-            .map(|file| {
-                let buf = self.fragment_buf.as_ref().unwrap();
-                let base = buf.shm.base_address().as_ptr() as usize;
-                let data_ptr = (base + buf.data_start) as *const f32;
-                let offsets_ptr = (base + buf.data_start + file.data_len * 4) as *const u64;
-                DataView::new(
-                    data_ptr,
-                    file.data_len,
-                    offsets_ptr,
-                    file.offset_len,
-                    buf.data_start as u64,
-                    file.channel_names.clone(),
-                )
-            });
-
-        Ok(super::tbo_hierarchy::TBOHierarchy::new(
-            scenes.map(|v| CollectionState::build(vec![v])).unwrap_or_default(),
-            assets.map(|v| CollectionState::build(vec![v])).unwrap_or_default(),
-            fragments.map(|v| CollectionState::build(vec![v])).unwrap_or_default(),
-        ))
-    }
-}
-
-impl TboExportContext {
-    fn get_format_buf(&self, format_name: &str) -> Result<&FormatBuffer, String> {
-        match format_name {
-            "scene" => self.scene_buf.as_ref().ok_or("No scene buffer".to_string()),
-            "asset" => self.asset_buf.as_ref().ok_or("No asset buffer".to_string()),
-            "fragment" => self.fragment_buf.as_ref().ok_or("No fragment buffer".to_string()),
-            _ => Err("Unknown format".to_string()),
-        }
-    }
-
-    fn reset_format(&mut self, format_name: &str) {
-        match format_name {
-            "scene" => {
-                let buf = self.scene_buf.as_mut().unwrap();
-                let file = self.scene_file.as_mut().unwrap();
-                reset_format(buf, file, "scene");
-            }
-            "asset" => {
-                let buf = self.asset_buf.as_mut().unwrap();
-                let file = self.asset_file.as_mut().unwrap();
-                reset_format(buf, file, "asset");
-            }
-            "fragment" => {
-                let buf = self.fragment_buf.as_mut().unwrap();
-                let file = self.fragment_file.as_mut().unwrap();
-                reset_format(buf, file, "fragment");
-            }
-            _ => {}
-        }
-    }
-
-    fn do_flush(&mut self) -> Result<Vec<(String, Vec<String>)>, String> {
-        loop {
-            let s_dp = self.scene_buf.as_ref().map(|b| b.data_ptr as u64).unwrap_or(0);
-            let s_rem = self.scene_buf.as_ref().map(|b| b.remaining as u64).unwrap_or(0);
-            let a_dp = self.asset_buf.as_ref().map(|b| b.data_ptr as u64).unwrap_or(0);
-            let a_rem = self.asset_buf.as_ref().map(|b| b.remaining as u64).unwrap_or(0);
-            let f_dp = self.fragment_buf.as_ref().map(|b| b.data_ptr as u64).unwrap_or(0);
-            let f_rem = self.fragment_buf.as_ref().map(|b| b.remaining as u64).unwrap_or(0);
-
-            let s_op = self.scene_buf.as_ref().map(|b| b.offset_ptr as u64).unwrap_or(0);
-            let a_op = self.asset_buf.as_ref().map(|b| b.offset_ptr as u64).unwrap_or(0);
-            let f_op = self.fragment_buf.as_ref().map(|b| b.offset_ptr as u64).unwrap_or(0);
-
-            match engine_api::tbo_export_command(
-                &self.slab_scene_name, &self.slab_asset_name, &self.slab_fragment_name,
-                s_dp, s_op, s_rem,
-                a_dp, a_op, a_rem,
-                f_dp, f_op, f_rem,
-                self.scene_transform, self.scene_similarity,
-                self.asset_embedding, self.asset_transform,
-                self.fragment_xyz, self.normal_variance,
-                self.surface_variation, self.combined,
-                self.target_point_count,
-            ) {
-                Ok(resp) => {
-                    let status = resp.header.status;
-                    let (s_count, a_count, f_count, s_bytes, a_bytes, f_bytes) =
-                        resp.read_tbo_export_response()
-                            .map_err(|e| format!("Failed to read export response: {}", e))?;
-
-                    if status != 0 {
-                        let buffer_to_flush = match status {
-                            1 => "scene",
-                            2 => "asset",
-                            3 => "fragment",
-                            _ => return Err(format!("Unknown overflow status: {}", status)),
-                        };
-                        let flushed = self.flush_format_to_disk(buffer_to_flush)?;
-                        if !flushed.is_empty() {
-                            return Ok(flushed);
-                        }
-                        continue;
-                    }
-
-                    let s_data_bytes = s_bytes - (s_count * 8);
-                    let a_data_bytes = a_bytes - (a_count * 8);
-                    let f_data_bytes = f_bytes - (f_count * 8);
-
-                    // Update buffer state AND LoadedFile handles
-                    if let Some(ref mut buf) = self.scene_buf {
-                        buf.data_ptr += s_data_bytes as usize;
-                        buf.offset_ptr -= (s_count as usize) * 8;
-                        buf.remaining -= s_bytes as usize;
-                        if let Some(ref mut file) = self.scene_file {
-                            file.data_len = (buf.data_ptr - buf.data_start) / 4;
-                            file.offset_len = (buf.buffer_size - buf.offset_ptr) / 8;
-                            file.entity_count = s_count as u32;
-                        }
-                    }
-                    if let Some(ref mut buf) = self.asset_buf {
-                        buf.data_ptr += a_data_bytes as usize;
-                        buf.offset_ptr -= (a_count as usize) * 8;
-                        buf.remaining -= a_bytes as usize;
-                        if let Some(ref mut file) = self.asset_file {
-                            file.data_len = (buf.data_ptr - buf.data_start) / 4;
-                            file.offset_len = (buf.buffer_size - buf.offset_ptr) / 8;
-                            file.entity_count = a_count as u32;
-                        }
-                    }
-                    if let Some(ref mut buf) = self.fragment_buf {
-                        buf.data_ptr += f_data_bytes as usize;
-                        buf.offset_ptr -= (f_count as usize) * 8;
-                        buf.remaining -= f_bytes as usize;
-                        if let Some(ref mut file) = self.fragment_file {
-                            file.data_len = (buf.data_ptr - buf.data_start) / 4;
-                            file.offset_len = (buf.buffer_size - buf.offset_ptr) / 8;
-                            file.entity_count = f_count as u32;
-                        }
-                    }
-
-                    engine_api::drop_all_groups_command()?;
-                    self.accumulated_bytes = 0;
-                    return Ok(vec![]);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-    }
-
-    fn flush_format_to_disk(&mut self, format_name: &str) -> Result<Vec<(String, Vec<String>)>, String> {
-        let buf = self.get_format_buf(format_name)?;
-        let base = buf.shm.base_address().as_ptr() as usize;
-        let data_ptr = buf.data_ptr;
-        let offset_ptr = buf.offset_ptr;
-        let buf_size = buf.buffer_size;
-        let data_start = buf.data_start;
-
-        if data_ptr == data_start {
-            return Ok(vec![]);
-        }
-
-        // Update entity_count in header
-        let offset_count = (buf_size - offset_ptr) / 8;
-        unsafe {
-            let header_ptr = base as *mut u32;
-            std::ptr::write_unaligned(header_ptr.add(16), offset_count as u32);
-        }
-
-        // Write buffer to disk
-        let filename = tbo_writer::write_tbo_file(
-            unsafe { std::slice::from_raw_parts(base as *const u8, buf_size) },
-            data_ptr,
-            offset_ptr,
-            &self.output_dir,
-            format_name,
-        )?;
-
-        // Reset buffer and LoadedFile to initial state
-        self.reset_format(format_name);
-
-        Ok(vec![(format_name.to_string(), vec![filename])])
-    }
-
-    fn resolve_channel_names(&self, format_name: &str) -> Vec<String> {
-        let mut names = Vec::new();
-        match format_name {
-            "scene" => {
-                if self.scene_transform {
-                    for i in 0..16 {
-                        names.push(format!("trans_{:02}", i));
-                    }
-                }
-                if self.scene_similarity {
-                    names.push("similarity".to_string());
-                }
-            }
-            "asset" => {
-                if self.asset_embedding {
-                    for i in 0..256 {
-                        names.push(format!("emb_{:03}", i));
-                    }
-                }
-                if self.asset_transform {
-                    for i in 0..16 {
-                        names.push(format!("trans_{:02}", i));
-                    }
-                }
-            }
-            "fragment" => {
-                if self.fragment_xyz {
-                    names.push("xyz_x".to_string());
-                    names.push("xyz_y".to_string());
-                    names.push("xyz_z".to_string());
-                }
-                if self.normal_variance {
-                    names.push("normal_variance".to_string());
-                }
-                if self.surface_variation {
-                    names.push("surface_variation".to_string());
-                }
-                if self.combined {
-                    names.push("combined".to_string());
-                }
-            }
-            _ => {}
-        }
-        names
+    /// Build a Scene->Asset->Fragment hierarchy over the current buffer contents.
+    /// Views are zero-copy into shared memory; each format's backing stays alive
+    /// via its own mapping, independent of this context.
+    fn get_hierarchy(&self, _py: Python) -> PyResult<TBOHierarchy> {
+        build_hierarchy(
+            self.format_views(FormatKey::Scene)?,
+            self.format_views(FormatKey::Asset)?,
+            self.format_views(FormatKey::Fragment)?,
+        )
     }
 }
