@@ -34,36 +34,31 @@ mod elbo_sdk_rust {
         _py: Python,
         uuids: Vec<Uuid>,
         surface_contexts: Vec<u32>,
-    ) -> () {
-        let _ = engine_api::standardize_synced_groups_command(uuids, surface_contexts)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    ) {
+        let _ = engine_api::standardize_synced_groups_command(uuids, surface_contexts);
     }
 
     #[pyfunction]
     fn set_surface_types_command(
         _py: Python,
         group_surface_map: std::collections::HashMap<Uuid, i64>,
-    ) -> () {
-        let _ = engine_api::set_surface_types_command(group_surface_map)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    ) {
+        let _ = engine_api::set_surface_types_command(group_surface_map);
     }
 
     #[pyfunction]
-    fn drop_groups_command(_py: Python, uuids: Vec<Uuid>) -> () {
-        let _ = engine_api::drop_groups_command(uuids)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn drop_groups_command(_py: Python, uuids: Vec<Uuid>) {
+        let _ = engine_api::drop_groups_command(uuids);
     }
 
     #[pyfunction]
-    fn get_surface_types_command(_py: Python) -> () {
-        let _ = engine_api::get_surface_types_command()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn get_surface_types_command(_py: Python) {
+        let _ = engine_api::get_surface_types_command();
     }
 
     #[pyfunction]
-    fn organize_objects_command(_py: Python) -> () {
-        let _ = engine_api::organize_objects_command()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn organize_objects_command(_py: Python) {
+        let _ = engine_api::organize_objects_command();
     }
 
     #[pyfunction]
@@ -93,6 +88,7 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
+    #[allow(clippy::too_many_arguments)]
     fn prepare_mesh_send(
         vert_counts: Vec<u32>,
         edge_counts: Vec<u32>,
@@ -119,9 +115,8 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn standardize_groups_command(_py: Python, uuids: Vec<Uuid>) -> () {
-        let _ = engine_api::standardize_groups_command(uuids)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn standardize_groups_command(_py: Python, uuids: Vec<Uuid>) {
+        let _ = engine_api::standardize_groups_command(uuids);
     }
 
     #[pyfunction]
@@ -139,27 +134,23 @@ mod elbo_sdk_rust {
         _py: Python,
         path: String,
         uuids: Vec<Uuid>,
-    ) -> () {
-        let _ = engine_api::export_assets_command(&path, uuids)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    ) {
+        let _ = engine_api::export_assets_command(&path, uuids);
     }
 
     #[pyfunction]
-    fn export_all_command(_py: Python, path: String) -> () {
-        let _ = engine_api::export_all_command(&path)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn export_all_command(_py: Python, path: String) {
+        let _ = engine_api::export_all_command(&path);
     }
 
     #[pyfunction]
-    fn drop_all_groups_command(_py: Python) -> () {
-        let _ = engine_api::drop_all_groups_command()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn drop_all_groups_command(_py: Python) {
+        let _ = engine_api::drop_all_groups_command();
     }
 
     #[pyfunction]
-    fn import_assets_command(_py: Python, paths: Vec<String>) -> () {
-        let _ = engine_api::import_assets_command(paths)
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn import_assets_command(_py: Python, paths: Vec<String>) {
+        let _ = engine_api::import_assets_command(paths);
     }
 
     #[pymodule_init]
@@ -172,62 +163,8 @@ mod elbo_sdk_rust {
     }
 
     #[pyfunction]
-    fn group_all_objects_command(_py: Python) -> () {
-        let _ = engine_api::group_all_objects_command()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()));
+    fn group_all_objects_command(_py: Python) {
+        let _ = engine_api::group_all_objects_command();
     }
 
-    #[pyfunction]
-    fn tbo_export_command(
-        slab_scene_name: Vec<u8>,
-        slab_asset_name: Vec<u8>,
-        slab_fragment_name: Vec<u8>,
-        scene_data_ptr: u64,
-        scene_offset_ptr: u64,
-        scene_remaining: u64,
-        asset_data_ptr: u64,
-        asset_offset_ptr: u64,
-        asset_remaining: u64,
-        frag_data_ptr: u64,
-        frag_offset_ptr: u64,
-        frag_remaining: u64,
-        scene_transform: bool,
-        scene_similarity: bool,
-        asset_embedding: bool,
-        asset_transform: bool,
-        fragment_xyz: bool,
-        normal_variance: bool,
-        surface_variation: bool,
-        combined: bool,
-        target_point_count: u32,
-    ) -> PyResult<(u64, u64, u64, u64, u64, u64)> {
-        let slab_scene: [u8; 64] = slab_scene_name.try_into()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("slab_scene_name must be 64 bytes"))?;
-        let slab_asset: [u8; 64] = slab_asset_name.try_into()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("slab_asset_name must be 64 bytes"))?;
-        let slab_fragment: [u8; 64] = slab_fragment_name.try_into()
-            .map_err(|_| PyErr::new::<pyo3::exceptions::PyValueError, _>("slab_fragment_name must be 64 bytes"))?;
-        let resp = engine_api::tbo_export_command(
-            &slab_scene, &slab_asset, &slab_fragment,
-            scene_data_ptr, scene_offset_ptr, scene_remaining,
-            asset_data_ptr, asset_offset_ptr, asset_remaining,
-            frag_data_ptr, frag_offset_ptr, frag_remaining,
-            scene_transform, scene_similarity,
-            asset_embedding, asset_transform,
-            fragment_xyz, normal_variance,
-            surface_variation, combined,
-            target_point_count,
-        )
-        .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e))?;
-        if resp.header.status != 0 {
-            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                "tbo_export: buffer full - insufficient space in export buffer".to_string(),
-            ));
-        }
-        let result = resp.read_tbo_export_response()
-            .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                format!("Failed to read export response: {}", e),
-            ))?;
-        Ok(result)
-    }
 }
