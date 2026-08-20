@@ -116,38 +116,19 @@ impl EntityInner {
 
     /// Resolve the currently selected entity, plus the parent's selected row.
     fn resolve(&mut self, py: Python) {
-        match self.child.state {
-            StateRef::Points => {
-                let parent = self
-                    .parent
-                    .as_ref()
-                    .expect("points always have a parent");
-                // Points are rows of the parent fragment entity.
-                let row_bytes = parent.bytes_per_element * parent.row_stride;
-                self.resolved = Some(Resolved {
-                    data_ptr: unsafe { parent.base_ptr.add(self.local_idx * row_bytes) },
-                    data_len: row_bytes,
-                    row_stride: parent.row_stride,
-                    channels: parent.channels.clone(),
-                    bytes_per_element: parent.bytes_per_element,
-                });
-            }
-            state => {
-                let resolved = {
-                    let h = self.hierarchy_ref.borrow(py);
-                    state
-                        .get_state(&h)
-                        .and_then(|s| s.resolve_entity(self.entity_idx).ok())
-                };
-                self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels, bytes_per_element)| Resolved {
-                    data_ptr,
-                    data_len,
-                    row_stride,
-                    channels,
-                    bytes_per_element,
-                });
-            }
-        }
+        let resolved = {
+            let h = self.hierarchy_ref.borrow(py);
+            self.child.state
+                .get_state(&h)
+                .and_then(|s| s.resolve_entity(self.entity_idx).ok())
+        };
+        self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels, bytes_per_element)| Resolved {
+            data_ptr,
+            data_len,
+            row_stride,
+            channels,
+            bytes_per_element,
+        });
         if let Some(parent) = self.parent.as_mut() {
             let row_bytes = parent.bytes_per_element * parent.row_stride;
             parent.row_ptr = unsafe { parent.base_ptr.add(self.local_idx * row_bytes) };

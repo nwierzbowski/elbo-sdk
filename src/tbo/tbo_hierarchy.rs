@@ -1,4 +1,4 @@
-//! TBO Hierarchy - unified access to the Scene -> Asset -> Fragment hierarchy.
+//! TBO Hierarchy - unified access to the Scene -> Asset -> Fragment/Points/Faces hierarchy.
 //!
 //! Child transitions are a fixed set, resolved by name in `resolve_child`.
 //! `build_hierarchy` verifies the cross-format alignment invariants (parent
@@ -14,9 +14,8 @@ pub enum StateRef {
     Scenes,
     Assets,
     Fragments,
-    /// Terminal level: points are rows of their parent fragment entity, so they
-    /// have no backing collection state of their own.
     Points,
+    Faces,
 }
 
 impl StateRef {
@@ -25,7 +24,8 @@ impl StateRef {
             StateRef::Scenes => Some(&h.scenes_state),
             StateRef::Assets => Some(&h.assets_state),
             StateRef::Fragments => Some(&h.fragments_state),
-            StateRef::Points => None,
+            StateRef::Points => Some(&h.points_state),
+            StateRef::Faces => Some(&h.faces_state),
         }
     }
 }
@@ -33,7 +33,7 @@ impl StateRef {
 /// A contiguous range of entities within one state, plus the state it belongs to.
 #[derive(Clone, Copy)]
 pub struct ChildInfo {
-    /// Range start within the child state (always 0 for Points).
+    /// Range start within the child state.
     pub offset: usize,
     pub count: usize,
     pub state: StateRef,
@@ -44,19 +44,25 @@ pub struct TBOHierarchy {
     pub scenes_state: CollectionState,
     pub assets_state: CollectionState,
     pub fragments_state: CollectionState,
+    pub points_state: CollectionState,
+    pub faces_state: CollectionState,
 }
 
-/// Build a hierarchy from the three format pairs, in the order scenes, assets,
-/// fragments.
+/// Build a hierarchy from the five format pairs, in the order scenes, assets,
+/// fragments, points, faces.
 pub fn build_hierarchy(
     scenes: FormatPair,
     assets: FormatPair,
     fragments: FormatPair,
+    points: FormatPair,
+    faces: FormatPair,
 ) -> PyResult<TBOHierarchy> {
     TBOHierarchy::new(
         CollectionState::build(scenes.0, scenes.1)?,
         CollectionState::build(assets.0, assets.1)?,
         CollectionState::build(fragments.0, fragments.1)?,
+        CollectionState::build(points.0, points.1)?,
+        CollectionState::build(faces.0, faces.1)?,
     )
 }
 
@@ -87,6 +93,16 @@ impl TBOHierarchy {
         root(slf, py, StateRef::Fragments)
     }
 
+    #[getter(Points)]
+    fn points(slf: PyRef<Self>, py: Python) -> HierarchicalEntity {
+        root(slf, py, StateRef::Points)
+    }
+
+    #[getter(Faces)]
+    fn faces(slf: PyRef<Self>, py: Python) -> HierarchicalEntity {
+        root(slf, py, StateRef::Faces)
+    }
+
     #[getter(scene_count)]
     fn scene_count(&self) -> usize {
         self.scenes_state.total_entities()
@@ -101,6 +117,16 @@ impl TBOHierarchy {
     fn fragment_count(&self) -> usize {
         self.fragments_state.total_entities()
     }
+
+    #[getter(points_count)]
+    fn points_count(&self) -> usize {
+        self.points_state.total_entities()
+    }
+
+    #[getter(faces_count)]
+    fn faces_count(&self) -> usize {
+        self.faces_state.total_entities()
+    }
 }
 
 impl TBOHierarchy {
@@ -108,12 +134,37 @@ impl TBOHierarchy {
         scenes: CollectionState,
         assets: CollectionState,
         fragments: CollectionState,
+        points: CollectionState,
+        faces: CollectionState,
     ) -> PyResult<Self> {
         validate_cross_format(&scenes, &assets, &fragments)?;
+        // Points and Faces should align with Fragments (same entity count as fragments)
+        if !fragments.views.is_empty() && !points.views.is_empty() {
+            if fragments.total_entities() != points.total_entities() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "hierarchy misaligned: {} fragment entit(ies) != {} points entit(ies). \
+                     Points and Faces should have the same entity count as Fragments.",
+                    fragments.total_entities(),
+                    points.total_entities()
+                )));
+            }
+        }
+        if !fragments.views.is_empty() && !faces.views.is_empty() {
+            if fragments.total_entities() != faces.total_entities() {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                    "hierarchy misaligned: {} fragment entit(ies) != {} faces entit(ies). \
+                     Points and Faces should have the same entity count as Fragments.",
+                    fragments.total_entities(),
+                    faces.total_entities()
+                )));
+            }
+        }
         Ok(Self {
             scenes_state: scenes,
             assets_state: assets,
             fragments_state: fragments,
+            points_state: points,
+            faces_state: faces,
         })
     }
 
@@ -126,7 +177,8 @@ impl TBOHierarchy {
         let (expected_parent, child_state) = match name {
             "Assets" => (StateRef::Scenes, StateRef::Assets),
             "Fragments" => (StateRef::Assets, StateRef::Fragments),
-            "Points" => (StateRef::Fragments, StateRef::Points),
+            "Points" => (StateRef::Assets, StateRef::Points),
+            "Faces" => (StateRef::Assets, StateRef::Faces),
             _ => return None,
         };
         if expected_parent != caller_state {
@@ -139,7 +191,7 @@ impl TBOHierarchy {
             return None;
         }
         Some(ChildInfo {
-            offset: if child_state == StateRef::Points { 0 } else { offset },
+            offset,
             count,
             state: child_state,
         })

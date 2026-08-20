@@ -549,7 +549,7 @@ impl TboExportContext {
         Ok(all_flushed)
     }
 
-    /// Build a Scene->Asset->Fragment hierarchy over the current buffer contents.
+    /// Build a Scene->Asset->Fragment/Points/Faces hierarchy over the current buffer contents.
     /// Views are zero-copy into shared memory; each format's backing stays alive
     /// via its own mapping, independent of this context.
     fn get_hierarchy(&self, _py: Python) -> PyResult<TBOHierarchy> {
@@ -557,6 +557,8 @@ impl TboExportContext {
             self.format_views(FormatKey::Scene)?,
             self.format_views(FormatKey::Asset)?,
             self.format_views(FormatKey::Fragment)?,
+            self.format_views(FormatKey::Points)?,
+            self.format_views(FormatKey::Faces)?,
         )
     }
 }

@@ -133,9 +133,15 @@ impl TboImportContext {
         Ok(())
     }
 
-    /// Build a TBOHierarchy linking scene, asset, and fragment collections.
+    /// Build a TBOHierarchy linking scene, asset, fragment, points, and faces collections.
     fn get_hierarchy(&self, _py: Python) -> PyResult<TBOHierarchy> {
-        build_hierarchy(self.format_views(0)?, self.format_views(1)?, self.format_views(2)?)
+        build_hierarchy(
+            self.format_views(0)?,
+            self.format_views(1)?,
+            self.format_views(2)?,
+            self.format_views(3)?,
+            self.format_views(4)?,
+        )
     }
 }
 
