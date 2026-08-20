@@ -110,6 +110,8 @@ class TboExportContext:
         normal_variance: bool,
         surface_variation: bool,
         combined: bool,
+        points_original: bool,
+        faces: bool,
         max_memory_mb: float,
         target_export_size_mb: float,
         target_point_count: int,
