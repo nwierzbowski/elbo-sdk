@@ -22,16 +22,18 @@ use super::tbo_writer;
 use super::{py_runtime_error, py_value_error};
 
 /// Identity of one export format, in the engine/protocol order
-/// `[scene, asset, fragment]` (slab arrays and response counts match it).
+/// `[scene, asset, fragment, points, faces]` (slab arrays and response counts match it).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FormatKey {
     Scene,
     Asset,
     Fragment,
+    Points,
+    Faces,
 }
 
 impl FormatKey {
-    const ALL: [FormatKey; 3] = [FormatKey::Scene, FormatKey::Asset, FormatKey::Fragment];
+    const ALL: [FormatKey; 5] = [FormatKey::Scene, FormatKey::Asset, FormatKey::Fragment, FormatKey::Points, FormatKey::Faces];
 
     /// Engine overflow-response status value identifying this format.
     fn from_overflow_status(status: u16) -> Option<Self> {
@@ -39,6 +41,8 @@ impl FormatKey {
             1 => Some(FormatKey::Scene),
             2 => Some(FormatKey::Asset),
             3 => Some(FormatKey::Fragment),
+            4 => Some(FormatKey::Points),
+            5 => Some(FormatKey::Faces),
             _ => None,
         }
     }
@@ -48,6 +52,8 @@ impl FormatKey {
             FormatKey::Scene => "scene",
             FormatKey::Asset => "asset",
             FormatKey::Fragment => "fragment",
+            FormatKey::Points => "points",
+            FormatKey::Faces => "faces",
         }
     }
 
@@ -83,13 +89,15 @@ pub struct TboExportContext {
     normal_variance: bool,
     surface_variation: bool,
     combined: bool,
+    points_original: bool,
+    faces: bool,
     target_point_count: u32,
     /// Bytes queued via `accumulate` since the last flush.
     accumulated_bytes: u64,
     /// Auto-flush threshold derived from `max_memory_mb`.
     flush_threshold: u64,
-    /// Slots in [scene, asset, fragment] order (see [`FormatKey::ALL`]).
-    slots: [FormatSlot; 3],
+    /// Slots in [scene, asset, fragment, points, faces] order (see [`FormatKey::ALL`]).
+    slots: [FormatSlot; 5],
     /// Allocate-memory batch staged by `prepare_mesh_send`, sent on `accumulate`.
     pending_asset_ctx: Option<AssetSyncContext>,
     pending_allocated_bytes: u64,
@@ -103,6 +111,8 @@ impl TboExportContext {
             FormatKey::Fragment => {
                 self.fragment_xyz || self.normal_variance || self.surface_variation || self.combined
             }
+            FormatKey::Points => self.points_original,
+            FormatKey::Faces => self.faces,
         }
     }
 
@@ -148,6 +158,20 @@ impl TboExportContext {
                     names.push("combined".to_string());
                 }
             }
+            FormatKey::Points => {
+                if self.points_original {
+                    names.push("vert_x".to_string());
+                    names.push("vert_y".to_string());
+                    names.push("vert_z".to_string());
+                }
+            }
+            FormatKey::Faces => {
+                if self.faces {
+                    names.push("face_i0".to_string());
+                    names.push("face_i1".to_string());
+                    names.push("face_i2".to_string());
+                }
+            }
         }
         names
     }
@@ -179,9 +203,9 @@ impl TboExportContext {
     /// One engine round-trip: send the export command (the engine blocks
     /// until it has written the queued entities) and interpret the response.
     fn run_export_command(&self, py: Python) -> PyResult<(u16, EngineCounts)> {
-        let mut data = [0u64; 3];
-        let mut offset = [0u64; 3];
-        let mut remaining = [0u64; 3];
+        let mut data = [0u64; 5];
+        let mut offset = [0u64; 5];
+        let mut remaining = [0u64; 5];
         for (i, slot) in self.slots.iter().enumerate() {
             if let Some(buf) = &slot.buf {
                 // Slab-relative byte offsets, as the engine expects.
@@ -193,10 +217,12 @@ impl TboExportContext {
 
         // Everything the closure needs copied into locals: `detach` runs it
         // off-thread, so it must not capture the context (SHM holders are !Send).
-        let names: [[u8; 64]; 3] = [
+        let names: [[u8; 64]; 5] = [
             self.slots[0].name,
             self.slots[1].name,
             self.slots[2].name,
+            self.slots[3].name,
+            self.slots[4].name,
         ];
         let (
             scene_transform,
@@ -207,6 +233,8 @@ impl TboExportContext {
             normal_variance,
             surface_variation,
             combined,
+            points_original,
+            faces,
             target_point_count,
         ) = (
             self.scene_transform,
@@ -217,16 +245,20 @@ impl TboExportContext {
             self.normal_variance,
             self.surface_variation,
             self.combined,
+            self.points_original,
+            self.faces,
             self.target_point_count,
         );
 
         let resp = py
             .detach(|| {
                 engine_api::tbo_export_command(
-                    &names[0], &names[1], &names[2],
+                    &names[0], &names[1], &names[2], &names[3], &names[4],
                     data[0], offset[0], remaining[0],
                     data[1], offset[1], remaining[1],
                     data[2], offset[2], remaining[2],
+                    data[3], offset[3], remaining[3],
+                    data[4], offset[4], remaining[4],
                     scene_transform,
                     scene_similarity,
                     asset_embedding,
@@ -235,18 +267,20 @@ impl TboExportContext {
                     normal_variance,
                     surface_variation,
                     combined,
+                    points_original,
+                    faces,
                     target_point_count,
                 )
             })
             .map_err(py_runtime_error)?;
 
         let status = resp.header.status;
-        let (sc, ac, fc, sb, ab, fb) = resp
+        let (sc, ac, fc, pc, fac, sb, ab, fb, pb, facb) = resp
             .read_tbo_export_response()
             .map_err(|e| py_runtime_error(format!("Failed to read export response: {e}")))?;
         Ok((status, EngineCounts {
-            counts: [sc, ac, fc],
-            reported_bytes: [sb, ab, fb],
+            counts: [sc, ac, fc, pc, fac],
+            reported_bytes: [sb, ab, fb, pb, facb],
         }))
     }
 
@@ -347,10 +381,10 @@ impl TboExportContext {
 }
 
 /// Entity counts and total reported bytes (data + offsets) per format,
-/// in [scene, asset, fragment] order.
+/// in [scene, asset, fragment, points, faces] order.
 struct EngineCounts {
-    counts: [u64; 3],
-    reported_bytes: [u64; 3],
+    counts: [u64; 5],
+    reported_bytes: [u64; 5],
 }
 
 #[pymethods]
@@ -369,6 +403,8 @@ impl TboExportContext {
         normal_variance,
         surface_variation,
         combined,
+        points_original,
+        faces,
         max_memory_mb,
         target_export_size_mb,
         target_point_count,
@@ -383,6 +419,8 @@ impl TboExportContext {
         normal_variance: bool,
         surface_variation: bool,
         combined: bool,
+        points_original: bool,
+        faces: bool,
         max_memory_mb: f64,
         target_export_size_mb: f64,
         target_point_count: u32,
@@ -391,9 +429,10 @@ impl TboExportContext {
         let flush_threshold = (max_memory_mb * 1024.0 * 1024.0) as u64;
 
         eprintln!(
-            "[TBO] Config: scene_transform={}, scene_similarity={}, asset_embedding={}, asset_transform={}, fragment_xyz={}, normal_variance={}, surface_variation={}, combined={}, max_memory={} MB, buffer_size={} MB, target_points={}",
+            "[TBO] Config: scene_transform={}, scene_similarity={}, asset_embedding={}, asset_transform={}, fragment_xyz={}, normal_variance={}, surface_variation={}, combined={}, points_original={}, faces={}, max_memory={} MB, buffer_size={} MB, target_points={}",
             scene_transform, scene_similarity, asset_embedding, asset_transform,
             fragment_xyz, normal_variance, surface_variation, combined,
+            points_original, faces,
             max_memory_mb, target_export_size_mb, target_point_count
         );
 
@@ -407,10 +446,14 @@ impl TboExportContext {
             normal_variance,
             surface_variation,
             combined,
+            points_original,
+            faces,
             target_point_count,
             accumulated_bytes: 0,
             flush_threshold,
             slots: [
+                FormatSlot::inactive(),
+                FormatSlot::inactive(),
                 FormatSlot::inactive(),
                 FormatSlot::inactive(),
                 FormatSlot::inactive(),

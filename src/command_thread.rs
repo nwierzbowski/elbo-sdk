@@ -8,6 +8,9 @@ use crossbeam::channel;
 
 const COMMAND_SERVICE_NAME: &str = "PivotEngine/CommandService";
 const COMMAND_EVENT_SERVICE_NAME: &str = "PivotEngine/CommandEvents";
+// iceoryx2 request/response receive is non-blocking; wait for the engine to
+// respond, polling briefly, up to this deadline before giving up.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub struct CommandWork {
     pub cmd: EngineCommand,
@@ -66,11 +69,24 @@ pub fn spawn_command_thread(
                     cmd_notifier
                         .notify()
                         .map_err(|e| format!("Notifier failed: {}", e))?;
-                    let res = pending
-                        .receive()
-                        .map_err(|e| format!("Receive failed: {}", e))?
-                        .ok_or_else(|| "Engine closed the request without a response".to_string())?;
-                    Ok(*res.payload())
+                    let deadline = std::time::Instant::now() + RESPONSE_TIMEOUT;
+                    loop {
+                        match pending
+                            .receive()
+                            .map_err(|e| format!("Receive failed: {}", e))?
+                        {
+                            Some(res) => return Ok(*res.payload()),
+                            None => {
+                                if std::time::Instant::now() >= deadline {
+                                    return Err(format!(
+                                        "Engine did not respond within {}s (engine stopped or command too slow)",
+                                        RESPONSE_TIMEOUT.as_secs()
+                                    ));
+                                }
+                                thread::sleep(Duration::from_micros(100));
+                            }
+                        }
+                    }
                 })();
 
                 let _ = work.response_tx.send(result);
