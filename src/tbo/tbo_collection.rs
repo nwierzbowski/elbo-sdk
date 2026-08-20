@@ -73,12 +73,13 @@ impl CollectionState {
             boundaries.push(cum);
             cum += v.entity_count();
             if v.channel_count > 0 {
-                if v.data_len % v.channel_count != 0 {
+                let row_bytes = v.bytes_per_element * v.channel_count;
+                if v.data_len % row_bytes != 0 {
                     return Err(py_value_error(
-                        "data length is not a multiple of channel count",
+                        "data length is not a multiple of row size",
                     ));
                 }
-                row_cum += v.data_len / v.channel_count;
+                row_cum += v.data_len / row_bytes;
             }
             row_boundaries.push(row_cum);
         }
@@ -126,10 +127,11 @@ impl CollectionState {
             0
         };
         let view = &self.views[view_idx];
-        let (start, _) = view.entity_f32_range(local_idx).ok_or_else(|| {
+        let (start, _) = view.entity_byte_range(local_idx).ok_or_else(|| {
             py_index_error("Entity index", global_entity_idx, self.total_entities())
         })?;
-        Ok(rows_before_view + start.checked_div(view.channel_count).unwrap_or(0))
+        let row_bytes = view.bytes_per_element * view.channel_count;
+        Ok(rows_before_view + start.checked_div(row_bytes).unwrap_or(0))
     }
 
     /// Number of rows (child entries) in the entity at the given global index.
@@ -138,14 +140,15 @@ impl CollectionState {
             py_index_error("Entity index", global_entity_idx, self.total_entities())
         })?;
         let view = &self.views[view_idx];
-        let (start, end) = view.entity_f32_range(local_idx).ok_or_else(|| {
+        let (start, end) = view.entity_byte_range(local_idx).ok_or_else(|| {
             py_index_error("Entity index", global_entity_idx, self.total_entities())
         })?;
-        Ok((end - start).checked_div(view.channel_count).unwrap_or(0))
+        let row_bytes = view.bytes_per_element * view.channel_count;
+        Ok((end - start).checked_div(row_bytes).unwrap_or(0))
     }
 
-    /// Resolves entity at given index to raw data pointer, length, row stride, and channels.
-    pub fn resolve_entity(&self, idx: usize) -> PyResult<(*const f32, usize, usize, ChannelSet)> {
+    /// Resolves entity at given index to raw data pointer, length, row stride, channels, and bytes per element.
+    pub fn resolve_entity(&self, idx: usize) -> PyResult<(*const u8, usize, usize, ChannelSet, usize)> {
         let total = self.total_entities();
         if total == 0 {
             return Err(PyErr::new::<pyo3::exceptions::PyIndexError, _>(
@@ -160,12 +163,12 @@ impl CollectionState {
         let (view_idx, local_idx) = self.resolve(idx).expect("bounds checked above");
         let view = &self.views[view_idx];
         let (start, end) = view
-            .entity_f32_range(local_idx)
+            .entity_byte_range(local_idx)
             .ok_or_else(|| py_index_error("Entity index", idx, total))?;
         let data_ptr = unsafe { view.data_ptr.add(start) };
         let data_len = end - start;
         let row_stride = view.channel_count;
-        Ok((data_ptr, data_len, row_stride, view.channels.clone()))
+        Ok((data_ptr, data_len, row_stride, view.channels.clone(), view.bytes_per_element))
     }
 }
 
@@ -223,12 +226,13 @@ mod tests {
         let file_order: Vec<u64> = write_order.iter().rev().copied().collect();
         let names: Vec<String> = (0..ch).map(|i| format!("c{i}")).collect();
         let view = DataView::new(
-            data.as_ptr(),
-            data.len(),
+            data.as_ptr() as *const u8,
+            data.len() * 4,
             file_order.as_ptr(),
             write_order.len(),
             0,
             ChannelSet::from_names(names),
+            4,
         );
         (view, data, file_order)
     }
@@ -251,11 +255,12 @@ mod tests {
     fn resolve_entity_returns_data_window() {
         let (v0, d0, f0) = make_view(&[4, 2], 2);
         let state = CollectionState::build(vec![v0], vec![backing()]).unwrap();
-        let (ptr, len, stride, channels) = state.resolve_entity(1).unwrap();
-        assert_eq!(ptr, unsafe { d0.as_ptr().add(4) });
+        let (ptr, len, stride, channels, bytes_per_element) = state.resolve_entity(1).unwrap();
+        assert_eq!(ptr, unsafe { d0.as_ptr().add(4) as *const u8 });
         assert_eq!(len, 2);
         assert_eq!(stride, 2);
         assert_eq!(channels.name_count(), 2);
+        assert_eq!(bytes_per_element, 4);
         assert!(state.resolve_entity(2).is_err());
         let _ = (&f0, &d0);
     }

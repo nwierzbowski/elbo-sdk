@@ -364,13 +364,16 @@ impl TboExportContext {
             return Ok((Vec::new(), Vec::new()));
         };
         let base = buf.shm.base_address().as_ptr() as usize;
+        // Faces format uses u64 (8 bytes per element), others use f32 (4 bytes)
+        let bytes_per_element = if key == FormatKey::Faces { 8 } else { 4 };
         let view = DataView::new(
-            (base + buf.data_start) as *const f32,
-            buf.data_len_f32(),
+            (base + buf.data_start) as *const u8,
+            buf.data_ptr - buf.data_start,  // byte count
             (base + buf.offset_region_start()) as *const u64,
             buf.offset_len(),
             buf.data_start as u64,
             buf.channels.clone(),
+            bytes_per_element,
         );
         let mapping = buffer::open_shm_mapping(&self.slot(key).name).map_err(py_runtime_error)?;
         // Not Sync: the backing is only ever read on the (single) Python thread.

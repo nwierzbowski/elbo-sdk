@@ -19,7 +19,7 @@ use super::tbo_reader;
 /// even after the file is unloaded from the context.
 pub struct DataHolder {
     pub path: String,
-    pub data: Vec<f32>,
+    pub data: Vec<u8>,
     pub offsets: Vec<u64>,
     pub channel_names: Vec<String>,
     pub format_index: u32,
@@ -158,6 +158,8 @@ impl TboImportContext {
                     .as_ref()
                     .ok_or_else(|| no_data_error(format!("file slot {}", i)))?,
             );
+            // Faces format (format_index == 4) uses u64 (8 bytes per element), others use f32 (4 bytes)
+            let bytes_per_element = if holder.format_index == 4 { 8 } else { 4 };
             views.push(DataView::new(
                 holder.data.as_ptr(),
                 holder.data.len(),
@@ -165,6 +167,7 @@ impl TboImportContext {
                 holder.offsets.len(),
                 holder.data_start,
                 ChannelSet::from_names(holder.channel_names.clone()),
+                bytes_per_element,
             ));
             let holder_arc = Arc::clone(&holder);
             let backing: DataBacking = holder_arc;

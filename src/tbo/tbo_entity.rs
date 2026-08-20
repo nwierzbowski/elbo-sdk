@@ -21,15 +21,17 @@ use super::{py_attr_error, py_index_error, py_value_error};
 /// The selected entity's resolved data window (zero-copy into backing memory).
 #[derive(Clone)]
 struct Resolved {
-    data_ptr: *const f32,
+    data_ptr: *const u8,
     data_len: usize,
     row_stride: usize,
     channels: ChannelSet,
+    bytes_per_element: usize,
 }
 
 impl Resolved {
     fn row_count(&self) -> usize {
-        self.data_len.checked_div(self.row_stride).unwrap_or(0)
+        let row_bytes = self.bytes_per_element * self.row_stride;
+        self.data_len.checked_div(row_bytes).unwrap_or(0)
     }
 }
 
@@ -37,10 +39,11 @@ impl Resolved {
 /// children can read parent attributes (e.g. `asset.sx`) by channel name.
 #[derive(Clone)]
 struct ParentRow {
-    base_ptr: *const f32,
+    base_ptr: *const u8,
     row_stride: usize,
     channels: ChannelSet,
-    row_ptr: *const f32,
+    row_ptr: *const u8,
+    bytes_per_element: usize,
 }
 
 struct EntityInner {
@@ -120,11 +123,13 @@ impl EntityInner {
                     .as_ref()
                     .expect("points always have a parent");
                 // Points are rows of the parent fragment entity.
+                let row_bytes = parent.bytes_per_element * parent.row_stride;
                 self.resolved = Some(Resolved {
-                    data_ptr: unsafe { parent.base_ptr.add(self.local_idx * parent.row_stride) },
-                    data_len: parent.row_stride,
+                    data_ptr: unsafe { parent.base_ptr.add(self.local_idx * row_bytes) },
+                    data_len: row_bytes,
                     row_stride: parent.row_stride,
                     channels: parent.channels.clone(),
+                    bytes_per_element: parent.bytes_per_element,
                 });
             }
             state => {
@@ -134,16 +139,18 @@ impl EntityInner {
                         .get_state(&h)
                         .and_then(|s| s.resolve_entity(self.entity_idx).ok())
                 };
-                self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels)| Resolved {
+                self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels, bytes_per_element)| Resolved {
                     data_ptr,
                     data_len,
                     row_stride,
                     channels,
+                    bytes_per_element,
                 });
             }
         }
         if let Some(parent) = self.parent.as_mut() {
-            parent.row_ptr = unsafe { parent.base_ptr.add(self.local_idx * parent.row_stride) };
+            let row_bytes = parent.bytes_per_element * parent.row_stride;
+            parent.row_ptr = unsafe { parent.base_ptr.add(self.local_idx * row_bytes) };
         }
     }
 
@@ -268,16 +275,19 @@ impl HierarchicalEntity {
         let rows = resolved.row_count();
         let base = resolved.data_ptr;
         let stride = resolved.row_stride;
+        let bytes_per_elem = resolved.bytes_per_element;
         let mut out = Vec::with_capacity(rows);
         for r in 0..rows {
-            out.push(unsafe { *base.add(r * stride + ch_idx) });
+            // Interpret as f32 for now (formats 0-3). Faces format (4) would need u64 interpretation.
+            let val = unsafe { *(base.add(r * stride * bytes_per_elem + ch_idx * bytes_per_elem) as *const f32) };
+            out.push(val);
         }
         let arr = numpy::PyArray1::<f32>::from_vec(py, out);
         Ok(arr.into_any().unbind())
     }
 
-    /// Read-only f32 memoryview of one row (channel_count f32) of the selected
-    /// entity. The row is copied into Python-owned bytes, so the view is safe
+    /// Read-only memoryview of one row of the selected entity.
+    /// The row is copied into Python-owned bytes, so the view is safe
     /// even if the hierarchy is later dropped or the buffer is reset.
     fn row(slf: PyRef<Self>, py: Python, idx: usize) -> PyResult<Py<PyAny>> {
         slf.inner.require_data()?;
@@ -286,9 +296,10 @@ impl HierarchicalEntity {
             return Err(py_index_error("Row index", idx, rows));
         }
         let resolved = slf.inner.resolved.as_ref().expect("require_data checked");
-        let ptr = unsafe { resolved.data_ptr.add(idx * resolved.row_stride) };
+        let row_bytes_count = resolved.row_stride * resolved.bytes_per_element;
+        let ptr = unsafe { resolved.data_ptr.add(idx * row_bytes_count) };
         let row_bytes =
-            unsafe { std::slice::from_raw_parts(ptr as *const u8, resolved.row_stride * 4) };
+            unsafe { std::slice::from_raw_parts(ptr, row_bytes_count) };
         let bytes = PyBytes::new(py, row_bytes);
         let mv = unsafe { ffi::PyMemoryView_FromObject(bytes.as_ptr()) };
         if mv.is_null() {
@@ -310,6 +321,7 @@ impl HierarchicalEntity {
             row_stride: r.row_stride,
             channels: r.channels.clone(),
             row_ptr: std::ptr::null(),
+            bytes_per_element: r.bytes_per_element,
         });
         Some(Self {
             inner: EntityInner::new(py, slf.inner.hierarchy_ref.clone_ref(py), info, parent),

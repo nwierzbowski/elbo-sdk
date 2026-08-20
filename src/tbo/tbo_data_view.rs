@@ -64,8 +64,8 @@ impl ChannelSet {
 /// Wraps one buffer's data + offsets via zero-copy pointers.
 #[derive(Clone)]
 pub struct DataView {
-    pub data_ptr: *const f32,
-    /// f32 element count in the data region.
+    pub data_ptr: *const u8,
+    /// Byte count in the data region.
     pub data_len: usize,
     /// Raw u64 offset pointer (start of offset region, lowest address).
     pub offsets_ptr: *const u64,
@@ -74,16 +74,19 @@ pub struct DataView {
     pub data_start: u64,
     pub channels: ChannelSet,
     pub channel_count: usize,
+    /// Bytes per element: 4 for f32 formats, 8 for u64 formats.
+    pub bytes_per_element: usize,
 }
 
 impl DataView {
     pub fn new(
-        data_ptr: *const f32,
+        data_ptr: *const u8,
         data_len: usize,
         offsets_ptr: *const u64,
         offset_len: usize,
         data_start: u64,
         channels: ChannelSet,
+        bytes_per_element: usize,
     ) -> Self {
         let channel_count = channels.name_count();
         Self {
@@ -94,6 +97,7 @@ impl DataView {
             data_start,
             channels,
             channel_count,
+            bytes_per_element,
         }
     }
 
@@ -101,23 +105,23 @@ impl DataView {
         self.offset_len.saturating_sub(1)
     }
 
-    /// Returns the (start_f32, end_f32) range of the entity at the given index.
+    /// Returns the (start_byte, end_byte) range of the entity at the given index.
     ///
     /// Offsets are stored in reverse entity order: in memory/file order,
     /// index `offset_len - 1 - i` holds the start of entity `i`
     /// (entity 0's start equals `data_start`), and index `offset_len - 2 - i`
     /// holds the end of entity `i`.
-    pub fn entity_f32_range(&self, entity_idx: usize) -> Option<(usize, usize)> {
+    pub fn entity_byte_range(&self, entity_idx: usize) -> Option<(usize, usize)> {
         if entity_idx >= self.entity_count() {
             return None;
         }
         let n = self.offset_len;
-        let raw_to_f32 = |raw_off: u64| {
-            ((raw_off.saturating_sub(self.data_start)) as usize) / 4
+        let raw_to_byte = |raw_off: u64| {
+            (raw_off.saturating_sub(self.data_start)) as usize
         };
         let raw_start = unsafe { *self.offsets_ptr.add(n - 1 - entity_idx) };
         let raw_end = unsafe { *self.offsets_ptr.add(n - 2 - entity_idx) };
-        Some((raw_to_f32(raw_start), raw_to_f32(raw_end)))
+        Some((raw_to_byte(raw_start), raw_to_byte(raw_end)))
     }
 
     /// Validates the offset array: strictly ascending in write order
@@ -127,7 +131,7 @@ impl DataView {
     pub fn validate(&self) -> PyResult<()> {
         let data_end = self
             .data_start
-            .checked_add((self.data_len * 4) as u64)
+            .checked_add(self.data_len as u64)
             .ok_or_else(|| py_value_error("data region overflows u64"))?;
 
         let n = self.offset_len;
@@ -166,15 +170,15 @@ impl DataView {
             }
             if self.channel_count > 0 {
                 let span_bytes = v - prev;
-                let span = span_bytes / 4;
-                if !span_bytes.is_multiple_of(4)
-                    || !span.is_multiple_of(self.channel_count as u64)
+                let row_bytes = self.bytes_per_element * self.channel_count;
+                if !span_bytes.is_multiple_of(self.bytes_per_element as u64)
+                    || (span_bytes as usize) % row_bytes != 0
                 {
                     return Err(py_value_error(format!(
-                        "entity {} span ({} f32) is not a multiple of channel count {}",
+                        "entity {} span ({} bytes) is not a multiple of row size {} bytes",
                         i - 1,
-                        span,
-                        self.channel_count
+                        span_bytes,
+                        row_bytes
                     )));
                 }
             }
@@ -201,12 +205,13 @@ mod tests {
         let file_order: Vec<u64> = write_order.iter().rev().copied().collect();
         let names: Vec<String> = (0..ch).map(|i| format!("c{i}")).collect();
         let view = DataView::new(
-            data.as_ptr(),
-            data.len(),
+            data.as_ptr() as *const u8,
+            data.len() * 4,
             file_order.as_ptr(),
             write_order.len(),
             0,
             ChannelSet::from_names(names),
+            4,
         );
         (view, data, file_order)
     }

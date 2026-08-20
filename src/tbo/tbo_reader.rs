@@ -16,7 +16,7 @@ pub struct TboFile {
     pub entity_count: u32,
     pub channel_count: u32,
     pub channel_names: Vec<String>,
-    pub data: Vec<f32>,
+    pub data: Vec<u8>,
     pub offsets: Vec<u64>,
 }
 
@@ -84,10 +84,14 @@ pub fn read_tbo_file(path: &str) -> Result<TboFile, String> {
     }
     let data_end = file_size - offsets_size;
     let data_bytes = (data_end - data_start) as usize;
-    if !data_bytes.is_multiple_of(4) {
+    
+    // Validate alignment based on format
+    // Format 4 (faces) uses u64 (8-byte aligned), others use f32 (4-byte aligned)
+    let required_alignment = if format_index == 4 { 8 } else { 4 };
+    if !data_bytes.is_multiple_of(required_alignment) {
         return Err(format!(
-            "TBO file {} data region ({} bytes) is not a multiple of 4",
-            path, data_bytes
+            "TBO file {} data region ({} bytes) is not a multiple of {} for format {}",
+            path, data_bytes, required_alignment, format_index
         ));
     }
 
@@ -95,12 +99,9 @@ pub fn read_tbo_file(path: &str) -> Result<TboFile, String> {
         .seek(SeekFrom::Start(data_start))
         .map_err(|e| format!("Failed to seek data in {}: {}", path, e))?;
 
-    let data_f32_count = data_bytes / 4;
-    let mut data = vec![0f32; data_f32_count];
+    let mut data = vec![0u8; data_bytes];
     reader
-        .read_exact(unsafe {
-            std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, data_bytes)
-        })
+        .read_exact(&mut data)
         .map_err(|e| format!("Failed to read data in {}: {}", path, e))?;
 
     let offset_count = (offsets_size / 8) as usize;
