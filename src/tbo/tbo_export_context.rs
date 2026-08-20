@@ -303,7 +303,7 @@ impl TboExportContext {
                 continue;
             }
 
-            let mut data_bytes = [0u64; 3];
+            let mut data_bytes = [0u64; 5];
             for (i, key) in FormatKey::ALL.iter().enumerate() {
                 data_bytes[i] = r.reported_bytes[i]
                     .checked_sub(r.counts[i] * 8)
