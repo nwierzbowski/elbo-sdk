@@ -116,19 +116,35 @@ impl EntityInner {
 
     /// Resolve the currently selected entity, plus the parent's selected row.
     fn resolve(&mut self, py: Python) {
-        let resolved = {
-            let h = self.hierarchy_ref.borrow(py);
-            self.child.state
-                .get_state(&h)
-                .and_then(|s| s.resolve_entity(self.entity_idx).ok())
-        };
-        self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels, bytes_per_element)| Resolved {
-            data_ptr,
-            data_len,
-            row_stride,
-            channels,
-            bytes_per_element,
-        });
+        if self.child.state == StateRef::SampledPoints {
+            // Terminal level: a sampled point is one row of the parent fragment.
+            let parent = self
+                .parent
+                .as_ref()
+                .expect("SampledPoints always have a parent");
+            let row_bytes = parent.bytes_per_element * parent.row_stride;
+            self.resolved = Some(Resolved {
+                data_ptr: unsafe { parent.base_ptr.add(self.local_idx * row_bytes) },
+                data_len: row_bytes,
+                row_stride: parent.row_stride,
+                channels: parent.channels.clone(),
+                bytes_per_element: parent.bytes_per_element,
+            });
+        } else {
+            let resolved = {
+                let h = self.hierarchy_ref.borrow(py);
+                self.child.state
+                    .get_state(&h)
+                    .and_then(|s| s.resolve_entity(self.entity_idx).ok())
+            };
+            self.resolved = resolved.map(|(data_ptr, data_len, row_stride, channels, bytes_per_element)| Resolved {
+                data_ptr,
+                data_len,
+                row_stride,
+                channels,
+                bytes_per_element,
+            });
+        }
         if let Some(parent) = self.parent.as_mut() {
             let row_bytes = parent.bytes_per_element * parent.row_stride;
             parent.row_ptr = unsafe { parent.base_ptr.add(self.local_idx * row_bytes) };
@@ -233,17 +249,22 @@ impl HierarchicalEntity {
 
     /// Parent-row scalar for the selected entity, addressed by channel name.
     /// Raises AttributeError for unknown names or when the entity has no parent.
+    /// Parent rows are always f32-backed (scene/asset/fragment).
     fn __getattr__(slf: PyRef<Self>, name: &str) -> PyResult<Py<PyAny>> {
         let parent = slf.inner.parent.as_ref().ok_or_else(|| py_attr_error(name))?;
         let ch_idx = parent.channels.index(name).ok_or_else(|| py_attr_error(name))?;
         if parent.row_ptr.is_null() {
             return Err(py_attr_error(name));
         }
-        let val = unsafe { *parent.row_ptr.add(ch_idx) };
+        let val = unsafe {
+            *(parent.row_ptr.add(ch_idx * parent.bytes_per_element) as *const f32)
+        };
         Ok(PyFloat::new(slf.py(), val as f64).into())
     }
 
-    /// All rows of one channel of the selected entity, as an (N,) f32 array.
+    /// All rows of one channel of the selected entity, as a 1-D array.
+    /// f32-backed formats (scene/asset/fragment/points) yield float32; the
+    /// u64 Faces format yields int64.
     fn channel(slf: PyRef<Self>, py: Python, name: &str) -> PyResult<Py<PyAny>> {
         let ch_idx = slf
             .inner
@@ -257,14 +278,23 @@ impl HierarchicalEntity {
         let base = resolved.data_ptr;
         let stride = resolved.row_stride;
         let bytes_per_elem = resolved.bytes_per_element;
-        let mut out = Vec::with_capacity(rows);
-        for r in 0..rows {
-            // Interpret as f32 for now (formats 0-3). Faces format (4) would need u64 interpretation.
-            let val = unsafe { *(base.add(r * stride * bytes_per_elem + ch_idx * bytes_per_elem) as *const f32) };
-            out.push(val);
+        if bytes_per_elem == 8 {
+            let mut out = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let val = unsafe { *(base.add(r * stride * bytes_per_elem + ch_idx * bytes_per_elem) as *const i64) };
+                out.push(val);
+            }
+            let arr = numpy::PyArray1::<i64>::from_vec(py, out);
+            Ok(arr.into_any().unbind())
+        } else {
+            let mut out = Vec::with_capacity(rows);
+            for r in 0..rows {
+                let val = unsafe { *(base.add(r * stride * bytes_per_elem + ch_idx * bytes_per_elem) as *const f32) };
+                out.push(val);
+            }
+            let arr = numpy::PyArray1::<f32>::from_vec(py, out);
+            Ok(arr.into_any().unbind())
         }
-        let arr = numpy::PyArray1::<f32>::from_vec(py, out);
-        Ok(arr.into_any().unbind())
     }
 
     /// Read-only memoryview of one row of the selected entity.

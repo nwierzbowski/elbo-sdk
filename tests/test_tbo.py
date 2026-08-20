@@ -13,12 +13,12 @@ def align16(n):
     return (n + 15) & ~15
 
 
-def build_tbo(path, format_index, channel_names, entities):
-    # entities: list of (rows, channels) float32 arrays
+def build_tbo(path, format_index, channel_names, entities, dtype="<f4"):
+    # entities: list of (rows, channels) arrays of `dtype`
     if entities:
-        data = np.concatenate([e.reshape(-1) for e in entities]).astype("<f4")
+        data = np.concatenate([e.reshape(-1) for e in entities]).astype(dtype)
     else:
-        data = np.zeros(0, dtype="<f4")
+        data = np.zeros(0, dtype=dtype)
     names = b"".join(n.encode("utf-8") + b"\0" for n in channel_names)
     data_start = align16(24 + len(names))
     offsets = [data_start]
@@ -54,9 +54,23 @@ def make_dataset(dirpath):
     ]
     build_tbo(dirpath / "fragment_0.tbo", 2, ["fx", "fy"], fragments)
 
+    # points: 6 entities x 2 rows (original verts), channels px/py/pz (f32)
+    points = [
+        np.array([[6 * i + 0, 6 * i + 1, 6 * i + 2], [6 * i + 3, 6 * i + 4, 6 * i + 5]], dtype="float32")
+        for i in range(6)
+    ]
+    build_tbo(dirpath / "points_0.tbo", 3, ["px", "py", "pz"], points)
+
+    # faces: 6 entities x 2 rows (triangles), channels fi0/fi1/fi2 (u64)
+    faces = [
+        np.array([[6 * i + 0, 6 * i + 1, 6 * i + 2], [6 * i + 3, 6 * i + 4, 6 * i + 5]], dtype="<u8")
+        for i in range(6)
+    ]
+    build_tbo(dirpath / "faces_0.tbo", 4, ["fi0", "fi1", "fi2"], faces, dtype="<u8")
+
 
 def load_all(ctx, dirpath):
-    for name in ("scene_0.tbo", "asset_0.tbo", "fragment_0.tbo"):
+    for name in ("scene_0.tbo", "asset_0.tbo", "fragment_0.tbo", "points_0.tbo", "faces_0.tbo"):
         ctx.load_file(str(dirpath / name))
 
 
@@ -69,6 +83,8 @@ class TestImportHierarchy:
         assert h.scene_count == 1
         assert h.asset_count == 3
         assert h.fragment_count == 6
+        assert h.points_count == 6
+        assert h.faces_count == 6
 
     def test_navigation_and_rows(self, tmp_path):
         make_dataset(tmp_path)
@@ -391,14 +407,14 @@ class TestImportHierarchy:
         assert "rows=4" in r
         assert "channels=2" in r
 
-    def test_points_access(self, tmp_path):
+    def test_sampled_points_access(self, tmp_path):
         make_dataset(tmp_path)
         ctx = TboImportContext()
         load_all(ctx, tmp_path)
         h = ctx.get_hierarchy()
         frag = h.Fragments[0]
         assert frag.row_count == 4
-        points = frag.get_child("Points")
+        points = frag.get_child("SampledPoints")
         assert points is not None
         assert len(points) == 4
         for i, pt in enumerate(points):
@@ -412,23 +428,23 @@ class TestImportHierarchy:
         with pytest.raises(IndexError):
             points[4]
 
-    def test_points_invalid_transitions(self, tmp_path):
+    def test_sampled_points_invalid_transitions(self, tmp_path):
         make_dataset(tmp_path)
         ctx = TboImportContext()
         load_all(ctx, tmp_path)
         h = ctx.get_hierarchy()
         scene = h.Scenes[0]
-        assert scene.get_child("Points") is None
+        assert scene.get_child("SampledPoints") is None
         asset = h.Assets[0]
-        assert asset.get_child("Points") is None
+        assert asset.get_child("SampledPoints") is None
         frag = h.Fragments[0]
-        points = frag.get_child("Points")
+        points = frag.get_child("SampledPoints")
         assert points is not None
         pt = points[0]
-        assert pt.get_child("Points") is None
+        assert pt.get_child("SampledPoints") is None
         assert pt.get_child("Fragments") is None
 
-    def test_points_parent_access(self, tmp_path):
+    def test_sampled_points_parent_access(self, tmp_path):
         make_dataset(tmp_path)
         ctx = TboImportContext()
         load_all(ctx, tmp_path)
@@ -440,11 +456,52 @@ class TestImportHierarchy:
         frags = assets.get_child("Fragments")
         assert frags is not None
         frags.selected_entity_idx = 0
-        points = frags.get_child("Points")
+        points = frags.get_child("SampledPoints")
         assert points is not None
         pt = points[0]
         assert pt.fx == pytest.approx(3.0)
         assert pt.fy == pytest.approx(103.0)
+
+    def test_points_format_as_asset_child(self, tmp_path):
+        # The real Points format (original verts, f32) is a child of Assets,
+        # a sibling of Fragments, aligned per-fragment in the same order.
+        make_dataset(tmp_path)
+        ctx = TboImportContext()
+        load_all(ctx, tmp_path)
+        h = ctx.get_hierarchy()
+        asset = h.Assets[0]
+        points = asset.get_child("Points")
+        assert points is not None
+        assert len(points) == 2  # asset 0 owns fragments 0 and 1
+        p = points[0]  # fragment 0's original vertices
+        assert p.row_count == 2
+        assert p.channel("px").dtype == np.float32
+        assert p.channel("px").tolist() == [0.0, 3.0]
+        assert p.channel("pz").tolist() == [2.0, 5.0]
+        p1 = points[1]
+        assert p1.channel("px").tolist() == [6.0, 9.0]
+        # Only Assets may parent the Points format; Fragments may not.
+        assert h.Fragments[0].get_child("Points") is None
+
+    def test_faces_format_as_asset_child(self, tmp_path):
+        # The Faces format (triangulated indices, u64) is a child of Assets,
+        # a sibling of Fragments. channel() surfaces it as int64.
+        make_dataset(tmp_path)
+        ctx = TboImportContext()
+        load_all(ctx, tmp_path)
+        h = ctx.get_hierarchy()
+        asset = h.Assets[0]
+        faces = asset.get_child("Faces")
+        assert faces is not None
+        assert len(faces) == 2
+        f = faces[0]  # fragment 0's triangles
+        assert f.row_count == 2
+        assert f.channel("fi0").dtype == np.int64
+        assert f.channel("fi0").tolist() == [0, 3]
+        assert f.channel("fi2").tolist() == [2, 5]
+        f1 = faces[1]
+        assert f1.channel("fi0").tolist() == [6, 9]
+        assert h.Fragments[0].get_child("Faces") is None
 
 
 def make_fragment(path):
@@ -464,6 +521,8 @@ class TestExportContext:
             False,
             False,
             False,
+            True,   # points_original
+            False,  # faces
             1.0,    # max_memory_mb
             1.0,    # target_export_size_mb
             64,     # target_point_count
@@ -475,6 +534,6 @@ class TestExportContext:
         assert h.fragment_count == 0
 
     def test_unique_slab_names(self, tmp_path):
-        ctx_a = TboExportContext(str(tmp_path), True, False, False, False, False, False, False, False, 1.0, 1.0, 64)
-        ctx_b = TboExportContext(str(tmp_path), True, False, False, False, False, False, False, False, 1.0, 1.0, 64)
+        ctx_a = TboExportContext(str(tmp_path), True, False, False, False, False, False, False, False, False, False, 1.0, 1.0, 64)
+        ctx_b = TboExportContext(str(tmp_path), True, False, False, False, False, False, False, False, False, False, 1.0, 1.0, 64)
         del ctx_a, ctx_b

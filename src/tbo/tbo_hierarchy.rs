@@ -1,4 +1,9 @@
-//! TBO Hierarchy - unified access to the Scene -> Asset -> Fragment/Points/Faces hierarchy.
+//! TBO Hierarchy - unified access to the
+//! Scene -> Asset -> {Fragment, Points, Faces} -> SampledPoints hierarchy.
+//!
+//! Fragments, Points and Faces are siblings (children of Assets), aligned
+//! per-fragment in the same order. SampledPoints is a terminal child of a
+//! Fragment exposing that fragment's downsampled point rows.
 //!
 //! Child transitions are a fixed set, resolved by name in `resolve_child`.
 //! `build_hierarchy` verifies the cross-format alignment invariants (parent
@@ -16,6 +21,9 @@ pub enum StateRef {
     Fragments,
     Points,
     Faces,
+    /// Terminal level: sampled points are the rows of their parent fragment
+    /// entity, so they have no backing collection state of their own.
+    SampledPoints,
 }
 
 impl StateRef {
@@ -26,6 +34,7 @@ impl StateRef {
             StateRef::Fragments => Some(&h.fragments_state),
             StateRef::Points => Some(&h.points_state),
             StateRef::Faces => Some(&h.faces_state),
+            StateRef::SampledPoints => None,
         }
     }
 }
@@ -179,6 +188,8 @@ impl TBOHierarchy {
             "Fragments" => (StateRef::Assets, StateRef::Fragments),
             "Points" => (StateRef::Assets, StateRef::Points),
             "Faces" => (StateRef::Assets, StateRef::Faces),
+            // Terminal: the sampled points are the rows of the parent fragment.
+            "SampledPoints" => (StateRef::Fragments, StateRef::SampledPoints),
             _ => return None,
         };
         if expected_parent != caller_state {
@@ -191,7 +202,8 @@ impl TBOHierarchy {
             return None;
         }
         Some(ChildInfo {
-            offset,
+            // SampledPoints are relative to the parent fragment (start at 0).
+            offset: if child_state == StateRef::SampledPoints { 0 } else { offset },
             count,
             state: child_state,
         })

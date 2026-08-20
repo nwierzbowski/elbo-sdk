@@ -155,7 +155,8 @@ class HierarchicalEntity:
 
     The cursor reports the selected entity's row count (row_count), its
     channel layout (channel_names), and per-entity row data via channel()
-    (an (N,) f32 array) and row() (a copied f32 memoryview).
+    (a 1-D array: float32 for f32-backed formats, int64 for the u64 Faces
+    format) and row() (a copied bytes memoryview).
 
     Child entities can read their parent's selected row by channel name
     (e.g. asset.sx). Unknown names raise AttributeError, as they do for
@@ -167,8 +168,8 @@ class HierarchicalEntity:
             for asset in scene.get_child("Assets"):
                 print(asset.sx)
                 for frag in asset.get_child("Fragments"):
-                    for pt in frag.get_child("Points"):
-                        x = pt.channel("xyz_x")[0]
+                    for pt in frag.get_child("SampledPoints"):
+                        x = pt.channel("fx")[0]
     """
     @property
     def row_count(self) -> int: ...
@@ -182,9 +183,14 @@ class HierarchicalEntity:
         ...
     @property
     def channel_names(self) -> List[str]: ...
-    def channel(self, name: str) -> np.ndarray: ...
+    def channel(self, name: str) -> np.ndarray:
+        """All rows of one channel as a 1-D array: float32 for f32-backed
+        formats (scene/asset/fragment/points/sampled), int64 for the u64
+        Faces format."""
+        ...
     def row(self, idx: int) -> memoryview:
-        """Read-only f32 memoryview of one row. The row data is copied into
+        """Read-only bytes memoryview of one raw row (little-endian elements;
+        f32 for most formats, u64 for Faces). The row data is copied into
         Python-owned bytes, so the view is safe even if the hierarchy is later
         dropped or the underlying buffer is reset."""
         ...
@@ -198,10 +204,14 @@ class HierarchicalEntity:
 
 
 class TBOHierarchy:
-    """Linked Scene -> Asset -> Fragment access over loaded TBO data.
+    """Linked Scene -> Asset -> {Fragment, Points, Faces} access over loaded
+    TBO data.
 
-    Scene rows align 1:1 with asset entities; asset rows align 1:1 with
-    fragment entities. get_hierarchy() rejects file sets that violate this.
+    Fragments, Points and Faces are siblings (children of Assets), aligned
+    per-fragment in the same order. A Fragment's downsampled point rows are
+    reachable via frag.get_child("SampledPoints"). Scene rows align 1:1 with
+    asset entities and asset rows 1:1 with fragment entities; get_hierarchy()
+    rejects file sets that violate this.
     """
     @property
     def Scenes(self) -> HierarchicalEntity: ...
@@ -210,8 +220,16 @@ class TBOHierarchy:
     @property
     def Fragments(self) -> HierarchicalEntity: ...
     @property
+    def Points(self) -> HierarchicalEntity: ...
+    @property
+    def Faces(self) -> HierarchicalEntity: ...
+    @property
     def scene_count(self) -> int: ...
     @property
     def asset_count(self) -> int: ...
     @property
     def fragment_count(self) -> int: ...
+    @property
+    def points_count(self) -> int: ...
+    @property
+    def faces_count(self) -> int: ...

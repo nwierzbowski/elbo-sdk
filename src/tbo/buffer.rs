@@ -125,11 +125,6 @@ impl FormatBuffer {
         self.data_ptr == self.data_start
     }
 
-    /// f32 element count in the data region.
-    pub fn data_len_f32(&self) -> usize {
-        (self.data_ptr - self.data_start) / 4
-    }
-
     /// Number of entities flushed into this buffer (excludes the seed offset).
     pub fn entity_count(&self) -> u64 {
         self.entity_count
